@@ -1,11 +1,9 @@
-// @path: index.js
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
-import { access } from 'node:fs/promises';
 import path from 'node:path';
-import os from 'node:os';
 import fft from 'fft-js';
 
+// Parameters shared with fingerprint builder
 const SAMPLE_RATE = 44100;
 const CHANNELS = 1;
 const WINDOW = 4096;
@@ -23,7 +21,20 @@ const hannWin = hann(WINDOW);
 
 const ffmpegToFloat32 = (file) =>
   new Promise((resolve, reject) => {
-    const args = ['-hide_banner', '-loglevel', 'error', '-i', file, '-ac', String(CHANNELS), '-ar', String(SAMPLE_RATE), '-f', 'f32le', '-'];
+    const args = [
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-i',
+      file,
+      '-ac',
+      String(CHANNELS),
+      '-ar',
+      String(SAMPLE_RATE),
+      '-f',
+      'f32le',
+      '-',
+    ];
     const p = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
     const chunks = [];
     let err = '';
@@ -116,89 +127,92 @@ function makeHashes(peaks, mags) {
   return hashes;
 }
 
-function mapsFromHashes(hashes, trackId) {
-  const out = Object.create(null);
-  for (const { key, t } of hashes) {
-    (out[key] ||= []).push([trackId, t]);
-  }
-  return out;
-}
-
-async function fingerprintPath(filePath, trackId) {
+async function fingerprintPath(filePath) {
   const float = await ffmpegToFloat32(filePath);
   const spec = stftMagnitudes(float);
   const peaks = topPeaksPerFrame(spec);
   const hashes = makeHashes(peaks, spec);
-  return mapsFromHashes(hashes, trackId);
+  return hashes; // array of {key, t}
 }
 
-async function atomicWrite(filePath, data) {
-  const tmp = `${filePath}.tmp`;
-  await fs.writeFile(tmp, data, 'utf8');
-  await fs.rename(tmp, filePath);
+function buildIndexLookup(indexObj) {
+  // indexObj expected shape: { index: { key: [[trackId, t], ...], ... }, meta: [...] }
+  if (!indexObj || typeof indexObj !== 'object' || !indexObj.index) throw new Error('Invalid index file');
+  return indexObj.index;
 }
 
-export async function buildIndex(dir, outFile = 'index.json') {
-  const files = (await fs.readdir(dir)).filter((n) => /\.(wav|mp3|flac|m4a|ogg|opus)$/i.test(n));
-  let merged = Object.create(null);
-  let meta = [];
-
-  // Resume support: if outFile exists, load it and skip already-processed tracks
-  try {
-    await access(outFile);
-    const prev = JSON.parse(await fs.readFile(outFile, 'utf8'));
-    if (prev && typeof prev === 'object') {
-      if (prev.index && typeof prev.index === 'object') merged = prev.index;
-      if (Array.isArray(prev.meta)) meta = prev.meta;
-    }
-  } catch {
-    // no previous index, start fresh
-  }
-
-  const done = new Set(meta);
-
-  for (let i = 0; i < files.length; i++) {
-    const name = files[i];
-    if (done.has(name)) {
-      const w = 30;
-      const filled = Math.round(((i + 1) / files.length) * w || 0);
-      process.stdout.write(
-        `\rProcessing: [${'='.repeat(filled)}${' '.repeat(w - filled)}] ${i + 1}/${files.length} (skipped)`
-      );
-      continue;
-    }
-    try {
-      const map = await fingerprintPath(path.join(dir, name), String(i + 1));
-      if (map) {
-        for (const k of Object.keys(map)) (merged[k] ||= []).push(...map[k]);
-        meta.push(name);
-        done.add(name);
+function matchHashesToIndex(queryHashes, indexLookup) {
+  // returns map: trackId -> Map(offset -> count) and totalMatchesPerTrack
+  const trackOffsets = new Map();
+  for (const { key, t: tq } of queryHashes) {
+    const entries = indexLookup[key];
+    if (!entries) continue;
+    for (const [trackId, ti] of entries) {
+      // offset = index_time - query_time (how far into indexed track the matching anchor is)
+      const offset = ti - tq;
+      let offs = trackOffsets.get(trackId);
+      if (!offs) {
+        offs = new Map();
+        trackOffsets.set(trackId, offs);
       }
-    } catch (e) {
-      console.error('skip', name, e.message);
+      offs.set(offset, (offs.get(offset) || 0) + 1);
     }
-    const w = 30;
-    const filled = Math.round(((i + 1) / files.length) * w || 0);
-    process.stdout.write(`\rProcessing: [${'='.repeat(filled)}${' '.repeat(w - filled)}] ${i + 1}/${files.length}`);
   }
-  process.stdout.write('\n');
-  await atomicWrite(outFile, JSON.stringify({ index: merged, meta: meta.length ? meta : files }, null, 2));
-  console.log('wrote', outFile);
+  return trackOffsets;
 }
 
+function summarizeMatches(trackOffsets, queryHashCount, meta = []) {
+  const results = [];
+  for (const [trackId, offs] of trackOffsets.entries()) {
+    // find top offset and votes
+    let bestOff = null;
+    let bestCount = 0;
+    for (const [off, cnt] of offs.entries()) {
+      if (cnt > bestCount) {
+        bestCount = cnt;
+        bestOff = off;
+      }
+    }
+    results.push({
+      trackId,
+      file: meta && meta.length ? meta[Number(trackId) - 1] || String(trackId) : String(trackId),
+      bestOffset: bestOff,
+      votes: bestCount,
+      matchRatio: +(bestCount / Math.max(1, queryHashCount)).toFixed(4),
+      offsets: Array.from(offs.entries()).sort((a, b) => b[1] - a[1]).slice(0, 8),
+    });
+  }
+  results.sort((a, b) => b.votes - a.votes);
+  return results;
+}
+
+export async function matchFileAgainstIndex(indexPath, queryFile, topN = 5) {
+  const raw = JSON.parse(await fs.readFile(indexPath, 'utf8'));
+  const indexLookup = buildIndexLookup(raw);
+  const meta = Array.isArray(raw.meta) ? raw.meta : [];
+
+  const qHashes = await fingerprintPath(queryFile);
+  const trackOffsets = matchHashesToIndex(qHashes, indexLookup);
+  const summary = summarizeMatches(trackOffsets, qHashes.length, meta).slice(0, topN);
+  return { query: queryFile, queryHashCount: qHashes.length, matches: summary };
+}
+
+// CLI wrapper
 if (import.meta.url === `file://${process.argv[1]}`) {
   (async () => {
-    const [, , cmd, a, b] = process.argv;
-    if (cmd === 'build' && a) {
-      try {
-        await buildIndex(a, b || 'index.json');
-      } catch (e) {
-        console.error(e);
-        process.exit(1);
+    try {
+      const [, , cmd, a, b, c] = process.argv;
+      if (cmd === 'match' && a && b) {
+        const top = c ? Number(c) : 5;
+        const out = await matchFileAgainstIndex(a, b, top);
+        console.log(JSON.stringify(out, null, 2));
+      } else {
+        console.error('usage: node match.js match <index.json> <queryFile> [topN]');
+        process.exit(2);
       }
-    } else {
-      console.error('usage: node fingerprint.js build <dir> [out.json]');
-      process.exit(2);
+    } catch (e) {
+      console.error(e && e.message ? e.message : e);
+      process.exit(1);
     }
   })();
 }
