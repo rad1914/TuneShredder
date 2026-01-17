@@ -1,4 +1,4 @@
-// @path: index.js
+// @path: fingerprint.js
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import { access } from 'node:fs/promises';
@@ -41,23 +41,43 @@ function stftMagnitudes(signal) {
   const half = WINDOW >> 1;
   const frames = [];
   const mags = new Float32Array(half);
+  const frame = new Array(WINDOW);
   for (let pos = 0; pos + WINDOW <= signal.length; pos += HOP) {
-    const frame = new Array(WINDOW);
     for (let i = 0; i < WINDOW; i++) frame[i] = signal[pos + i] * hannWin[i];
     const spec = fft.fft(frame);
-    for (let i = 0; i < half; i++) mags[i] = Math.hypot(spec[i][0], spec[i][1]);
-    frames.push(Float32Array.from(mags));
+    for (let i = 0; i < half; i++) {
+      const re = spec[i][0];
+      const im = spec[i][1];
+      mags[i] = re * re + im * im;
+    }
+    frames.push(mags.slice());
   }
   return frames;
 }
 
-function topKIndices(arr, k) {
-  return arr
-    .map((v, i) => ({ v, i }))
-    .sort((a, b) => b.v - a.v)
-    .slice(0, k)
-    .map((x) => x.i)
-    .filter((i) => i >= 0);
+function topKIndicesFloat(arr, k) {
+  const idx = new Int32Array(k);
+  const val = new Float32Array(k);
+  for (let i = 0; i < k; i++) {
+    idx[i] = -1;
+    val[i] = -Infinity;
+  }
+
+  for (let i = 0; i < arr.length; i++) {
+    const v = arr[i];
+    if (v <= val[k - 1]) continue;
+
+    let j = k - 1;
+    while (j > 0 && v > val[j - 1]) {
+      val[j] = val[j - 1];
+      idx[j] = idx[j - 1];
+      j--;
+    }
+    val[j] = v;
+    idx[j] = i;
+  }
+
+  return Array.from(idx).filter((i) => i >= 0);
 }
 
 function topPeaksPerFrame(frames) {
@@ -73,7 +93,7 @@ function topPeaksPerFrame(frames) {
       const v = row[i] - median;
       whitened[i] = v > 0 ? v : 0;
     }
-    const idxs = topKIndices(Array.from(whitened), TOP_PEAKS);
+    const idxs = topKIndicesFloat(whitened, TOP_PEAKS);
     const refined = idxs.map((i) => {
       const L = whitened[i - 1] || 0;
       const C = whitened[i] || 0;
