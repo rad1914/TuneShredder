@@ -1,5 +1,4 @@
 // @path: del.js
-
 import { readFile, unlink, stat } from 'node:fs/promises';
 import path from 'node:path';
 

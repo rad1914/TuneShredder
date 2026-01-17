@@ -13,83 +13,148 @@ const TOP_PEAKS = 3;
 const TARGET_ZONE = 16;
 const MAX_PAIRS = 2;
 
-const hann = (n) => Array.from({ length: n }, (_, i) => 0.5 * (1 - Math.cos((2 * Math.PI * i) / (n - 1))));
+const hann = (n) => {
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) out[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (n - 1)));
+  return out;
+};
 
 const hannWin = hann(WINDOW);
-const FRAME_BUF = new Float32Array(WINDOW);
 
-async function ffmpegToPCM(file) {
+async function ffmpegToFloat32(file) {
   return new Promise((resolve, reject) => {
-    const args = ['-hide_banner', '-loglevel', 'error', '-i', file, '-ac', String(CHANNELS), '-ar', String(SAMPLE_RATE), '-f', 's16le', '-'];
+    const args = [
+      '-hide_banner', '-loglevel', 'error',
+      '-i', file,
+      '-ac', String(CHANNELS),
+      '-ar', String(SAMPLE_RATE),
+      '-f', 'f32le',
+      '-'
+    ];
     const p = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
     const chunks = [];
     let err = '';
     p.stdout.on('data', c => chunks.push(c));
     p.stderr.on('data', c => { err += c.toString(); });
-    p.on('close', code => code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error('ffmpeg failed: ' + err)));
+    p.on('close', code => {
+      if (code !== 0) return reject(new Error('ffmpeg failed: ' + err));
+      const buf = Buffer.concat(chunks);
+      const float = new Float32Array(buf.buffer, buf.byteOffset, Math.floor(buf.length / 4));
+
+      resolve(new Float32Array(float));
+    });
   });
-}
-
-function pcm16ToFloat(buf) {
-
-  const len = buf.length >> 1;
-  const view = new Int16Array(buf.buffer, buf.byteOffset, len);
-  const out = new Float32Array(len);
-  for (let i = 0; i < len; i++) out[i] = view[i] / 32768;
-  return out;
 }
 
 function stftMagnitudes(signal) {
   const frames = [];
-  const frame = FRAME_BUF;
   const half = WINDOW >> 1;
-  for (let pos = 0; pos + WINDOW <= signal.length; pos += HOP) {
-    for (let i = 0; i < WINDOW; i++) frame[i] = signal[pos + i] * hannWin[i];
+  const frameArray = new Array(WINDOW);
+  const mags = new Float32Array(half);
 
-    const spec = fft.fft(Array.from(frame));
-    const mags = new Float32Array(half);
-    for (let i = 0; i < half; i++) mags[i] = Math.hypot(spec[i][0], spec[i][1]);
-    frames.push(mags);
+  for (let pos = 0; pos + WINDOW <= signal.length; pos += HOP) {
+
+    for (let i = 0; i < WINDOW; i++) frameArray[i] = signal[pos + i] * hannWin[i];
+
+    const spec = fft.fft(frameArray);
+    for (let i = 0; i < half; i++) {
+      const re = spec[i][0], im = spec[i][1];
+      mags[i] = Math.hypot(re, im);
+    }
+
+    frames.push(Float32Array.from(mags));
   }
   return frames;
 }
 
-function topKIndices(arr, k) {
-  const best = [];
+function topKIndicesSmall(arr, k) {
+  const bestVal = new Float32Array(k).fill(-Infinity);
+  const bestIdx = new Int32Array(k).fill(-1);
   for (let i = 0; i < arr.length; i++) {
     const v = arr[i];
-    if (best.length < k) {
-      best.push([v, i]);
-      if (best.length === k) best.sort((a, b) => a[0] - b[0]);
-    } else if (v > best[0][0]) {
-      best[0] = [v, i];
 
-      for (let j = 0; j < k - 1; j++) if (best[j][0] > best[j+1][0]) [best[j], best[j+1]] = [best[j+1], best[j]];
+    if (v <= bestVal[0]) continue;
+
+    let j = 0;
+    while (j < k && bestVal[j] < v) j++;
+    if (j === 0) {
+
+      bestVal[0] = v;
+      bestIdx[0] = i;
+    } else {
+
+      for (let s = 0; s < j - 1; s++) {
+        bestVal[s] = bestVal[s + 1];
+        bestIdx[s] = bestIdx[s + 1];
+      }
+      bestVal[j - 1] = v;
+      bestIdx[j - 1] = i;
     }
   }
-  best.sort((a, b) => b[0] - a[0]);
-  return best.map(p => p[1]);
+
+  const out = [];
+  for (let i = k - 1; i >= 0; i--) if (bestIdx[i] >= 0) out.push(bestIdx[i]);
+  return out;
 }
 
-function topPeaksPerFrame(spec) {
-  return spec.map(row => topKIndices(row, TOP_PEAKS).filter(i => row[i] > 1e-6));
+function topPeaksPerFrame(magsFrames) {
+  const peaks = [];
+  for (let f = 0; f < magsFrames.length; f++) {
+    const row = magsFrames[f];
+
+    const sampleStep = Math.max(1, Math.floor(row.length / 200));
+    const sample = [];
+    for (let i = 0; i < row.length; i += sampleStep) sample.push(row[i]);
+    sample.sort((a, b) => a - b);
+    const median = sample[Math.floor(sample.length / 2)] || 0;
+
+    const whitened = new Float32Array(row.length);
+    for (let i = 0; i < row.length; i++) {
+      const v = row[i] - median;
+      whitened[i] = v > 0 ? v : 0;
+    }
+
+    const idxs = topKIndicesSmall(whitened, TOP_PEAKS);
+
+    const refined = [];
+    for (const i of idxs) {
+      const left = whitened[i - 1] || 0;
+      const center = whitened[i] || 0;
+      const right = whitened[i + 1] || 0;
+      const denom = (left - 2 * center + right) || 1e-9;
+      const delta = 0.5 * (left - right) / denom;
+      refined.push(i + delta);
+    }
+    peaks.push(refined);
+  }
+  return peaks;
 }
 
-function makeHashes(peaks) {
-
+function makeHashes(peaks, magsPerFrame) {
   const hashes = [];
   for (let t = 0; t < peaks.length; t++) {
     const anchors = peaks[t];
+    if (!anchors || anchors.length === 0) continue;
     for (const f1 of anchors) {
-      const targets = [];
+      const candidates = [];
       for (let dt = 1; dt <= TARGET_ZONE; dt++) {
         const t2 = t + dt;
         if (t2 >= peaks.length) break;
-        for (const f2 of peaks[t2]) targets.push({ f2, dt });
+        for (const f2 of peaks[t2]) {
+
+          const b1 = Math.max(0, Math.min(magsPerFrame[t].length - 1, Math.round(f1)));
+          const b2 = Math.max(0, Math.min(magsPerFrame[t2].length - 1, Math.round(f2)));
+          const mag = (magsPerFrame[t][b1] || 1e-9) * (magsPerFrame[t2][b2] || 1e-9);
+          candidates.push({ f2, dt, mag });
+        }
       }
-      for (let i = 0; i < Math.min(MAX_PAIRS, targets.length); i++) {
-        const { f2, dt } = targets[i];
-        const key = `${f1}-${f2}-${dt}`;
+      if (candidates.length === 0) continue;
+      candidates.sort((a, b) => b.mag - a.mag);
+      for (let i = 0; i < Math.min(MAX_PAIRS, candidates.length); i++) {
+        const { f2, dt } = candidates[i];
+        const q1 = Math.round(f1);
+        const q2 = Math.round(f2);
+        const key = `${q1}-${q2}-${dt}`;
         hashes.push({ key, t });
       }
     }
@@ -142,11 +207,10 @@ function matchClip(indexObj, clipMap) {
 }
 
 async function fingerprintPath(filePath, trackId) {
-  const pcm = await ffmpegToPCM(filePath);
-  const float = pcm16ToFloat(pcm);
+  const float = await ffmpegToFloat32(filePath);
   const spec = stftMagnitudes(float);
   const peaks = topPeaksPerFrame(spec);
-  const hashes = makeHashes(peaks);
+  const hashes = makeHashes(peaks, spec);
   return mapsFromHashes(hashes, trackId);
 }
 
@@ -164,18 +228,31 @@ export async function buildIndex(dir, outFile = 'index.json') {
     try { return await fn(); } finally { running--; }
   };
 
+  const total = files.length;
+  let processed = 0;
+  const renderProgress = () => {
+    const width = 30;
+    const ratio = total === 0 ? 1 : processed / total;
+    const filled = Math.round(ratio * width);
+    const bar = '='.repeat(filled) + ' '.repeat(Math.max(0, width - filled));
+    process.stdout.write(`\rProcessing: [${bar}] ${processed}/${total}`);
+    if (processed === total) process.stdout.write('\n');
+  };
+  renderProgress();
+
   for (let i = 0; i < files.length; i++) {
     const name = files[i];
     const p = path.join(dir, name);
-    console.log('fingerprinting', name);
-    queue.push(runLimited(async () => {
+
+    const work = runLimited(async () => {
       try {
         return await fingerprintPath(p, String(i + 1));
       } catch (e) {
         console.error('skipping', name, e.message);
         return null;
       }
-    }));
+    });
+    queue.push(work.then((res) => { processed++; renderProgress(); return res; }));
   }
 
   const resolved = (await Promise.all(queue)).filter(Boolean);
@@ -188,11 +265,10 @@ export async function matchFile(clipPath, indexPath) {
   const raw = JSON.parse(await fs.readFile(indexPath, 'utf8'));
   const indexObj = raw.index;
   const clipMap = await (async () => {
-    const pcm = await ffmpegToPCM(clipPath);
-    const float = pcm16ToFloat(pcm);
+    const float = await ffmpegToFloat32(clipPath);
     const spec = stftMagnitudes(float);
     const peaks = topPeaksPerFrame(spec);
-    const hashes = makeHashes(peaks);
+    const hashes = makeHashes(peaks, spec);
     return mapsFromHashes(hashes, 'clip');
   })();
 
