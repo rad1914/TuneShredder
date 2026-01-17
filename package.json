@@ -1,5 +1,8 @@
-{ "type": "module" }, {
+{
+  "type": "module",
   "dependencies": {
-    "fast-glob": "^3.3.3"
+    "fast-glob": "^3.3.3",
+    "fft-js": "^0.0.12",
+    "minimist": "^1.2.8"
   }
 }
