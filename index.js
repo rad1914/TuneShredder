@@ -143,7 +143,6 @@ export async function buildIndex(dir, outFile = 'index.json') {
   let merged = Object.create(null);
   let meta = [];
 
-  // Resume support: if outFile exists, load it and skip already-processed tracks
   try {
     await access(outFile);
     const prev = JSON.parse(await fs.readFile(outFile, 'utf8'));
@@ -152,7 +151,7 @@ export async function buildIndex(dir, outFile = 'index.json') {
       if (Array.isArray(prev.meta)) meta = prev.meta;
     }
   } catch {
-    // no previous index, start fresh
+
   }
 
   const done = new Set(meta);
