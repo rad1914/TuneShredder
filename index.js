@@ -1,6 +1,8 @@
+// @path: index.js
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import { access } from 'node:fs/promises';
+import { setTimeout as sleep } from 'node:timers/promises';
 import path from 'node:path';
 import os from 'node:os';
 import fft from 'fft-js';
@@ -8,13 +10,13 @@ import fft from 'fft-js';
 const SAMPLE_RATE = 22050;
 const CHANNELS = 1;
 const WINDOW = 4096;
-const HOP = 1024;
-const TOP_PEAKS = 8;
-const TARGET_ZONE = 25;
-const MAX_PAIRS = 4;
-const FINGERPRINT_SECONDS = 20;
-const FREQ_Q = 4;
-const DT_Q = 1;
+const HOP = 512;
+const TOP_PEAKS = 16;
+const TARGET_ZONE = 55;
+const MAX_PAIRS = 6;
+const FINGERPRINT_SECONDS = 45;
+const FREQ_Q = 10;
+const DT_Q = 3;
 
 const hann = (n) => {
   const w = new Float32Array(n);
@@ -184,6 +186,31 @@ async function atomicWrite(filePath, data) {
   await fs.rename(tmp, filePath);
 }
 
+function makeHotWriter(outFile, getPayload) {
+  let pending = false;
+  let writing = false;
+
+  const flush = async () => {
+    if (writing) return;
+    if (!pending) return;
+    writing = true;
+    pending = false;
+    try {
+      await atomicWrite(outFile, JSON.stringify(getPayload(), null, 2));
+    } finally {
+      writing = false;
+      if (pending) await flush();
+    }
+  };
+
+  const markDirty = () => {
+    pending = true;
+    queueMicrotask(flush);
+  };
+
+  return { markDirty, flush };
+}
+
 export async function buildIndex(dir, outFile = 'index.json') {
   const files = (await fs.readdir(dir)).filter((n) => /\.(wav|mp3|flac|m4a|ogg|opus)$/i.test(n));
   let merged = Object.create(null);
@@ -202,31 +229,38 @@ export async function buildIndex(dir, outFile = 'index.json') {
 
   const done = new Set(meta);
 
+  const hot = makeHotWriter(outFile, () => ({ index: merged, meta }));
+
   for (let i = 0; i < files.length; i++) {
     const name = files[i];
     if (done.has(name)) {
       const w = 30;
       const filled = Math.round(((i + 1) / files.length) * w || 0);
       process.stdout.write(
-        `\rProcessing: [${'='.repeat(filled)}${' '.repeat(w - filled)}] ${i + 1}/${files.length} (skipped)`
+        `\rProcessing: [${'='.repeat(filled)}${' '.repeat(w - filled)}] ${i + 1}/${files.length} (skipped) | ${name}`
       );
       continue;
     }
     try {
+      process.stdout.write(`\rTrack: ${name}`);
       const map = await fingerprintPath(path.join(dir, name), name);
       if (map) {
         for (const k of Object.keys(map)) (merged[k] ||= []).push(...map[k]);
         meta.push(name);
         done.add(name);
+        hot.markDirty();
       }
     } catch (e) {
       console.error('skip', name, e.message);
     }
     const w = 30;
     const filled = Math.round(((i + 1) / files.length) * w || 0);
-    process.stdout.write(`\rProcessing: [${'='.repeat(filled)}${' '.repeat(w - filled)}] ${i + 1}/${files.length}`);
+    process.stdout.write(
+      `\rProcessing: [${'='.repeat(filled)}${' '.repeat(w - filled)}] ${i + 1}/${files.length} | ${name}`
+    );
   }
   process.stdout.write('\n');
+  await hot.flush();
   await atomicWrite(outFile, JSON.stringify({ index: merged, meta }, null, 2));
   console.log('wrote', outFile);
 }
