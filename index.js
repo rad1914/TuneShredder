@@ -6,6 +6,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import path from 'node:path';
 import os from 'node:os';
 import fft from 'fft-js';
+import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
 
 const SAMPLE_RATE = 22050;
 const CHANNELS = 1;
@@ -172,6 +173,25 @@ function mapsFromHashes(hashes, trackId) {
   return out;
 }
 
+async function runWorkerFingerprint(filePath, trackId) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL(import.meta.url), {
+      workerData: { filePath, trackId }
+    });
+
+    worker.once('message', (msg) => {
+      if (msg && msg.ok) resolve(msg.map);
+      else reject(new Error(msg?.error || 'worker failed'));
+    });
+
+    worker.once('error', reject);
+
+    worker.once('exit', (code) => {
+      if (code !== 0) reject(new Error(`worker exit ${code}`));
+    });
+  });
+}
+
 async function fingerprintPath(filePath, trackId) {
   const float = await ffmpegToFloat32(filePath);
   const spec = stftMagnitudes(float);
@@ -231,41 +251,70 @@ export async function buildIndex(dir, outFile = 'index.json') {
 
   const hot = makeHotWriter(outFile, () => ({ index: merged, meta }));
 
-  for (let i = 0; i < files.length; i++) {
-    const name = files[i];
-    if (done.has(name)) {
-      const w = 30;
-      const filled = Math.round(((i + 1) / files.length) * w || 0);
-      process.stdout.write(
-        `\rProcessing: [${'='.repeat(filled)}${' '.repeat(w - filled)}] ${i + 1}/${files.length} (skipped) | ${name}`
-      );
-      continue;
-    }
-    try {
-      process.stdout.write(`\rTrack: ${name}`);
-      const map = await fingerprintPath(path.join(dir, name), name);
-      if (map) {
-        for (const k of Object.keys(map)) (merged[k] ||= []).push(...map[k]);
-        meta.push(name);
-        done.add(name);
-        hot.markDirty();
-      }
-    } catch (e) {
-      console.error('skip', name, e.message);
-    }
+  const concurrency = Math.max(1, Math.min(os.cpus().length, 8));
+  let nextIndex = 0;
+  let processed = 0;
+
+  const updateProgress = (name, skipped = false) => {
     const w = 30;
-    const filled = Math.round(((i + 1) / files.length) * w || 0);
+    const filled = Math.round(((processed) / files.length) * w || 0);
     process.stdout.write(
-      `\rProcessing: [${'='.repeat(filled)}${' '.repeat(w - filled)}] ${i + 1}/${files.length} | ${name}`
+      `\rProcessing: [${'='.repeat(filled)}${' '.repeat(w - filled)}] ${processed}/${files.length}${skipped ? ' (skipped)' : ''} | ${name}`
     );
-  }
+  };
+
+  const workerLoop = async () => {
+    while (true) {
+      const i = nextIndex++;
+      if (i >= files.length) break;
+
+      const name = files[i];
+
+      if (done.has(name)) {
+        processed++;
+        updateProgress(name, true);
+        continue;
+      }
+
+      try {
+        process.stdout.write(`\rTrack: ${name}`);
+        const map = await runWorkerFingerprint(path.join(dir, name), name);
+        if (map) {
+          for (const k of Object.keys(map)) (merged[k] ||= []).push(...map[k]);
+          meta.push(name);
+          done.add(name);
+          hot.markDirty();
+        }
+      } catch (e) {
+        console.error('\nskip', name, e.message);
+      }
+
+      processed++;
+      updateProgress(name);
+    }
+  };
+
+  await Promise.all(Array.from({ length: concurrency }, () => workerLoop()));
+
   process.stdout.write('\n');
   await hot.flush();
   await atomicWrite(outFile, JSON.stringify({ index: merged, meta }, null, 2));
   console.log('wrote', outFile);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (!isMainThread) {
+  (async () => {
+    try {
+      const { filePath, trackId } = workerData;
+      const map = await fingerprintPath(filePath, trackId);
+      parentPort.postMessage({ ok: true, map });
+    } catch (e) {
+      parentPort.postMessage({ ok: false, error: e?.message || String(e) });
+    }
+  })();
+}
+
+if (isMainThread && import.meta.url === `file://${process.argv[1]}`) {
   (async () => {
     const [, , cmd, a, b] = process.argv;
     if (cmd === 'build' && a) {
