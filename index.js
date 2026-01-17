@@ -1,4 +1,3 @@
-// @path: fingerprint.js
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import { access } from 'node:fs/promises';
@@ -40,44 +39,55 @@ const ffmpegToFloat32 = (file) =>
 function stftMagnitudes(signal) {
   const half = WINDOW >> 1;
   const frames = [];
-  const mags = new Float32Array(half);
-  const frame = new Array(WINDOW);
   for (let pos = 0; pos + WINDOW <= signal.length; pos += HOP) {
+    const frame = new Float32Array(WINDOW);
     for (let i = 0; i < WINDOW; i++) frame[i] = signal[pos + i] * hannWin[i];
     const spec = fft.fft(frame);
-    for (let i = 0; i < half; i++) {
-      const re = spec[i][0];
-      const im = spec[i][1];
-      mags[i] = re * re + im * im;
-    }
-    frames.push(mags.slice());
+    const mags = new Float32Array(half);
+    for (let i = 0; i < half; i++) mags[i] = Math.hypot(spec[i][0], spec[i][1]);
+    frames.push(mags);
   }
   return frames;
 }
 
-function topKIndicesFloat(arr, k) {
-  const idx = new Int32Array(k);
-  const val = new Float32Array(k);
-  for (let i = 0; i < k; i++) {
-    idx[i] = -1;
-    val[i] = -Infinity;
+function topKIndicesFloat32(arr, k) {
+  if (k <= 0) return [];
+  if (k === 1) {
+    let bi = -1, bv = -Infinity;
+    for (let i = 0; i < arr.length; i++) {
+      const v = arr[i];
+      if (v > bv) { bv = v; bi = i; }
+    }
+    return bi >= 0 ? [bi] : [];
   }
-
+  if (k === 2) {
+    let i1 = -1, v1 = -Infinity;
+    let i2 = -1, v2 = -Infinity;
+    for (let i = 0; i < arr.length; i++) {
+      const v = arr[i];
+      if (v > v1) { v2 = v1; i2 = i1; v1 = v; i1 = i; }
+      else if (v > v2) { v2 = v; i2 = i; }
+    }
+    const out = [];
+    if (i1 >= 0) out.push(i1);
+    if (i2 >= 0) out.push(i2);
+    return out;
+  }
+  // k >= 3 (we only use TOP_PEAKS=3)
+  let i1 = -1, v1 = -Infinity;
+  let i2 = -1, v2 = -Infinity;
+  let i3 = -1, v3 = -Infinity;
   for (let i = 0; i < arr.length; i++) {
     const v = arr[i];
-    if (v <= val[k - 1]) continue;
-
-    let j = k - 1;
-    while (j > 0 && v > val[j - 1]) {
-      val[j] = val[j - 1];
-      idx[j] = idx[j - 1];
-      j--;
-    }
-    val[j] = v;
-    idx[j] = i;
+    if (v > v1) { v3 = v2; i3 = i2; v2 = v1; i2 = i1; v1 = v; i1 = i; }
+    else if (v > v2) { v3 = v2; i3 = i2; v2 = v; i2 = i; }
+    else if (v > v3) { v3 = v; i3 = i; }
   }
-
-  return Array.from(idx).filter((i) => i >= 0);
+  const out = [];
+  if (i1 >= 0) out.push(i1);
+  if (i2 >= 0) out.push(i2);
+  if (i3 >= 0) out.push(i3);
+  return out;
 }
 
 function topPeaksPerFrame(frames) {
@@ -93,7 +103,7 @@ function topPeaksPerFrame(frames) {
       const v = row[i] - median;
       whitened[i] = v > 0 ? v : 0;
     }
-    const idxs = topKIndicesFloat(whitened, TOP_PEAKS);
+    const idxs = topKIndicesFloat32(whitened, TOP_PEAKS);
     const refined = idxs.map((i) => {
       const L = whitened[i - 1] || 0;
       const C = whitened[i] || 0;
