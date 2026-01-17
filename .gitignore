@@ -3,3 +3,5 @@ dupe.txt
 .dedupe-cache.json
 _FULL
 m.shazam-index.json
+t.shazam-index.json
+t/
