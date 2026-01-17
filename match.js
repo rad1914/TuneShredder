@@ -2,6 +2,10 @@
 import * as fs from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 
+const MIN_ABSOLUTE_MATCHES = 3;
+const MIN_SCORE = 0.2;
+const MIN_DELTA_RATIO = 0.6;
+
 const safeParseInt = (x) => {
   const n = Number.parseInt(x, 10);
   return Number.isFinite(n) ? n : NaN;
@@ -102,6 +106,10 @@ function analyzePairs(pairsMap, hashCounts, meta = []) {
       const percentOfA = hcA ? (bestCount / hcA) * 100 : 0;
       const percentOfB = hcB ? (bestCount / hcB) * 100 : 0;
 
+      if (bestCount < MIN_ABSOLUTE_MATCHES) continue;
+      if (score < MIN_SCORE) continue;
+      if (totalMatches > 0 && (bestCount / totalMatches) < MIN_DELTA_RATIO) continue;
+
       results.push({
         pairKey: `${idA}|${idB}`,
         idA,
@@ -170,5 +178,3 @@ if (fileURLToPath(import.meta.url) === process.argv[1]) {
     process.exit(1);
   });
 }
-
-export { buildPairMaps, analyzePairs, readIndex, writeOutput };
