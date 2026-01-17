@@ -1,4 +1,3 @@
-// @path: index.js
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import { access } from 'node:fs/promises';
@@ -18,6 +17,11 @@ const MAX_PAIRS = 6;
 const FINGERPRINT_SECONDS = 45;
 const FREQ_Q = 10;
 const DT_Q = 3;
+
+// Prevent JSON explosion / memory death:
+// each hash key bucket will store at most N entries.
+const MAX_BUCKET = 250;
+const DEDUPE_BUCKET = true;
 
 const hann = (n) => {
   const w = new Float32Array(n);
@@ -167,8 +171,23 @@ function makeHashes(peaks, mags) {
 
 function mapsFromHashes(hashes, trackId) {
   const out = Object.create(null);
+  const seen = DEDUPE_BUCKET ? Object.create(null) : null;
+
   for (const { key, t } of hashes) {
-    (out[key] ||= []).push([trackId, t]);
+    const bucket = (out[key] ||= []);
+
+    if (bucket.length >= MAX_BUCKET) continue;
+
+    if (DEDUPE_BUCKET) {
+      // quantize time a bit so tiny float jitter doesn't create infinite "unique" entries
+      const tq = Math.round(t / 2) * 2;
+      const sig = `${trackId}|${tq}`;
+      if ((seen[key] ||= new Set()).has(sig)) continue;
+      seen[key].add(sig);
+      bucket.push([trackId, tq]);
+    } else {
+      bucket.push([trackId, t]);
+    }
   }
   return out;
 }
@@ -216,7 +235,7 @@ function makeHotWriter(outFile, getPayload) {
     writing = true;
     pending = false;
     try {
-      await atomicWrite(outFile, JSON.stringify(getPayload(), null, 2));
+      await atomicWrite(outFile, JSON.stringify(getPayload()));
     } finally {
       writing = false;
       if (pending) await flush();
@@ -249,7 +268,8 @@ export async function buildIndex(dir, outFile = 'index.json') {
 
   const done = new Set(meta);
 
-  const hot = makeHotWriter(outFile, () => ({ index: merged, meta }));
+  // Only write progress meta frequently; full index only once at the end.
+  const hot = makeHotWriter(outFile, () => ({ meta }));
 
   const concurrency = Math.max(1, Math.min(os.cpus().length, 8));
   let nextIndex = 0;
@@ -280,7 +300,14 @@ export async function buildIndex(dir, outFile = 'index.json') {
         process.stdout.write(`\rTrack: ${name}`);
         const map = await runWorkerFingerprint(path.join(dir, name), name);
         if (map) {
-          for (const k of Object.keys(map)) (merged[k] ||= []).push(...map[k]);
+          for (const k of Object.keys(map)) {
+            const dst = (merged[k] ||= []);
+            // merge but cap to MAX_BUCKET to prevent JSON/string blow-up
+            const src = map[k];
+            for (let j = 0; j < src.length && dst.length < MAX_BUCKET; j++) {
+              dst.push(src[j]);
+            }
+          }
           meta.push(name);
           done.add(name);
           hot.markDirty();
@@ -298,7 +325,8 @@ export async function buildIndex(dir, outFile = 'index.json') {
 
   process.stdout.write('\n');
   await hot.flush();
-  await atomicWrite(outFile, JSON.stringify({ index: merged, meta }, null, 2));
+  // one final write with the full (possibly large) index
+  await atomicWrite(outFile, JSON.stringify({ index: merged, meta }));
   console.log('wrote', outFile);
 }
 
