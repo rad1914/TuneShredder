@@ -6,13 +6,13 @@ import path from 'node:path';
 import os from 'node:os';
 import fft from 'fft-js';
 
-const SAMPLE_RATE = 44100;
+const SAMPLE_RATE = 22050;
 const CHANNELS = 1;
-const WINDOW = 4096;
-const HOP = 2048;
+const WINDOW = 1024;
+const HOP = 8192;
 const TOP_PEAKS = 3;
-const TARGET_ZONE = 16;
-const MAX_PAIRS = 2;
+const TARGET_ZONE = 4;
+const MAX_PAIRS = 1;
 
 const hann = (n) => {
   const w = new Float32Array(n);
