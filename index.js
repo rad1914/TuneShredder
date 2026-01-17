@@ -1,8 +1,8 @@
 // @path: index.js
-
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import os from 'node:os';
 import fft from 'fft-js';
 
 const SAMPLE_RATE = 44100;
@@ -14,6 +14,9 @@ const TARGET_ZONE = 16;
 const MAX_PAIRS = 2;
 
 const hann = (n) => Array.from({ length: n }, (_, i) => 0.5 * (1 - Math.cos((2 * Math.PI * i) / (n - 1))));
+
+const hannWin = hann(WINDOW);
+const FRAME_BUF = new Float32Array(WINDOW);
 
 async function ffmpegToPCM(file) {
   return new Promise((resolve, reject) => {
@@ -28,31 +31,48 @@ async function ffmpegToPCM(file) {
 }
 
 function pcm16ToFloat(buf) {
-  const out = new Float32Array(buf.length / 2);
-  for (let i = 0; i < out.length; i++) out[i] = buf.readInt16LE(i * 2) / 32768;
+
+  const len = buf.length >> 1;
+  const view = new Int16Array(buf.buffer, buf.byteOffset, len);
+  const out = new Float32Array(len);
+  for (let i = 0; i < len; i++) out[i] = view[i] / 32768;
   return out;
 }
 
 function stftMagnitudes(signal) {
-  const window = hann(WINDOW);
   const frames = [];
+  const frame = FRAME_BUF;
+  const half = WINDOW >> 1;
   for (let pos = 0; pos + WINDOW <= signal.length; pos += HOP) {
-    const frame = new Array(WINDOW);
-    for (let i = 0; i < WINDOW; i++) frame[i] = signal[pos + i] * window[i];
-    const spec = fft.fft(frame);
-    const mags = spec.slice(0, WINDOW / 2).map(c => Math.hypot(c[0], c[1]));
+    for (let i = 0; i < WINDOW; i++) frame[i] = signal[pos + i] * hannWin[i];
+
+    const spec = fft.fft(Array.from(frame));
+    const mags = new Float32Array(half);
+    for (let i = 0; i < half; i++) mags[i] = Math.hypot(spec[i][0], spec[i][1]);
     frames.push(mags);
   }
   return frames;
 }
 
-function topPeaksPerFrame(spec) {
+function topKIndices(arr, k) {
+  const best = [];
+  for (let i = 0; i < arr.length; i++) {
+    const v = arr[i];
+    if (best.length < k) {
+      best.push([v, i]);
+      if (best.length === k) best.sort((a, b) => a[0] - b[0]);
+    } else if (v > best[0][0]) {
+      best[0] = [v, i];
 
-  return spec.map(row => {
-    const pairs = row.map((v, i) => [v, i]);
-    pairs.sort((a, b) => b[0] - a[0]);
-    return pairs.slice(0, TOP_PEAKS).filter(p => p[0] > 1e-6).map(p => p[1]);
-  });
+      for (let j = 0; j < k - 1; j++) if (best[j][0] > best[j+1][0]) [best[j], best[j+1]] = [best[j+1], best[j]];
+    }
+  }
+  best.sort((a, b) => b[0] - a[0]);
+  return best.map(p => p[1]);
+}
+
+function topPeaksPerFrame(spec) {
+  return spec.map(row => topKIndices(row, TOP_PEAKS).filter(i => row[i] > 1e-6));
 }
 
 function makeHashes(peaks) {
@@ -100,14 +120,11 @@ function mergeMaps(maps) {
 function matchClip(indexObj, clipMap) {
   const votes = new Map();
 
-  const clipTimesByKey = new Map();
-  for (const [k, arr] of clipMap) clipTimesByKey.set(k, arr.map(x => x[1]));
-
-  for (const [key, entries] of Object.entries(indexObj)) {
-    const clipTs = clipTimesByKey.get(key);
-    if (!clipTs) continue;
-    for (const [trackId, tTrack] of entries) {
-      for (const tClip of clipTs) {
+  for (const [key, clipEntries] of clipMap) {
+    const idxEntries = indexObj[key];
+    if (!idxEntries) continue;
+    for (const [trackId, tTrack] of idxEntries) {
+      for (const [, tClip] of clipEntries) {
         const off = tTrack - tClip;
         const kk = `${trackId}|${off}`;
         votes.set(kk, (votes.get(kk) || 0) + 1);
@@ -136,17 +153,33 @@ async function fingerprintPath(filePath, trackId) {
 export async function buildIndex(dir, outFile = 'index.json') {
   const files = (await fs.readdir(dir)).filter(n => /\.(wav|mp3|flac|m4a|ogg|opus)$/i.test(n));
   const maps = [];
+
+  const CONCURRENCY = Math.max(1, os.cpus().length - 1);
+  let running = 0;
+  const queue = [];
+
+  const runLimited = async (fn) => {
+    while (running >= CONCURRENCY) await new Promise(r => setTimeout(r, 20));
+    running++;
+    try { return await fn(); } finally { running--; }
+  };
+
   for (let i = 0; i < files.length; i++) {
     const name = files[i];
     const p = path.join(dir, name);
     console.log('fingerprinting', name);
-    try {
-      maps.push(await fingerprintPath(p, String(i + 1)));
-    } catch (e) {
-      console.error('skipping', name, e.message);
-    }
+    queue.push(runLimited(async () => {
+      try {
+        return await fingerprintPath(p, String(i + 1));
+      } catch (e) {
+        console.error('skipping', name, e.message);
+        return null;
+      }
+    }));
   }
-  const merged = mergeMaps(maps);
+
+  const resolved = (await Promise.all(queue)).filter(Boolean);
+  const merged = mergeMaps(resolved);
   await fs.writeFile(outFile, JSON.stringify({ index: merged, meta: files }, null, 2), 'utf8');
   console.log('wrote', outFile);
 }
