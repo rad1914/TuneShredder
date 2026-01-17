@@ -1,4 +1,3 @@
-// @path: index.js
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import { access } from 'node:fs/promises';
@@ -8,11 +7,14 @@ import fft from 'fft-js';
 
 const SAMPLE_RATE = 22050;
 const CHANNELS = 1;
-const WINDOW = 1024;
-const HOP = 8192;
-const TOP_PEAKS = 3;
-const TARGET_ZONE = 4;
-const MAX_PAIRS = 1;
+const WINDOW = 4096;
+const HOP = 1024;
+const TOP_PEAKS = 8;
+const TARGET_ZONE = 25;
+const MAX_PAIRS = 4;
+const FINGERPRINT_SECONDS = 20;
+const FREQ_Q = 4;
+const DT_Q = 1;
 
 const hann = (n) => {
   const w = new Float32Array(n);
@@ -23,7 +25,14 @@ const hannWin = hann(WINDOW);
 
 const ffmpegToFloat32 = (file) =>
   new Promise((resolve, reject) => {
-    const args = ['-hide_banner', '-loglevel', 'error', '-i', file, '-ac', String(CHANNELS), '-ar', String(SAMPLE_RATE), '-f', 'f32le', '-'];
+    const args = [
+      '-hide_banner', '-loglevel', 'error',
+      '-t', String(FINGERPRINT_SECONDS),
+      '-i', file,
+      '-ac', String(CHANNELS),
+      '-ar', String(SAMPLE_RATE),
+      '-f', 'f32le', '-'
+    ];
     const p = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
     const chunks = [];
     let err = '';
@@ -45,7 +54,10 @@ function stftMagnitudes(signal) {
     for (let i = 0; i < WINDOW; i++) frame[i] = signal[pos + i] * hannWin[i];
     const spec = fft.fft(frame);
     const mags = new Float32Array(half);
-    for (let i = 0; i < half; i++) mags[i] = Math.hypot(spec[i][0], spec[i][1]);
+    for (let i = 0; i < half; i++) {
+      const m = Math.hypot(spec[i][0], spec[i][1]);
+      mags[i] = Math.log1p(m);
+    }
     frames.push(mags);
   }
   return frames;
@@ -139,7 +151,10 @@ function makeHashes(peaks, mags) {
       candidates.sort((a, b) => b.mag - a.mag);
       for (let i = 0; i < Math.min(MAX_PAIRS, candidates.length); i++) {
         const { f2, dt } = candidates[i];
-        const key = `${Math.round(f1)}-${Math.round(f2)}-${dt}`;
+        const q1 = Math.round(f1 / FREQ_Q);
+        const q2 = Math.round(f2 / FREQ_Q);
+        const qdt = Math.round(dt / DT_Q);
+        const key = `${q1}-${q2}-${qdt}`;
         hashes.push({ key, t });
       }
     }
