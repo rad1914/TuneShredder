@@ -1,3 +1,4 @@
+// @path: index.js
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import { access } from 'node:fs/promises';
@@ -73,7 +74,7 @@ function topKIndicesFloat32(arr, k) {
     if (i2 >= 0) out.push(i2);
     return out;
   }
-  // k >= 3 (we only use TOP_PEAKS=3)
+
   let i1 = -1, v1 = -Infinity;
   let i2 = -1, v2 = -Infinity;
   let i3 = -1, v3 = -Infinity;
@@ -178,7 +179,7 @@ export async function buildIndex(dir, outFile = 'index.json') {
     const prev = JSON.parse(await fs.readFile(outFile, 'utf8'));
     if (prev && typeof prev === 'object') {
       if (prev.index && typeof prev.index === 'object') merged = prev.index;
-      if (Array.isArray(prev.meta)) meta = prev.meta;
+      if (Array.isArray(prev.meta)) meta = prev.meta.filter((x) => typeof x === 'string');
     }
   } catch {
 
@@ -197,7 +198,7 @@ export async function buildIndex(dir, outFile = 'index.json') {
       continue;
     }
     try {
-      const map = await fingerprintPath(path.join(dir, name), String(i + 1));
+      const map = await fingerprintPath(path.join(dir, name), name);
       if (map) {
         for (const k of Object.keys(map)) (merged[k] ||= []).push(...map[k]);
         meta.push(name);
@@ -211,7 +212,7 @@ export async function buildIndex(dir, outFile = 'index.json') {
     process.stdout.write(`\rProcessing: [${'='.repeat(filled)}${' '.repeat(w - filled)}] ${i + 1}/${files.length}`);
   }
   process.stdout.write('\n');
-  await atomicWrite(outFile, JSON.stringify({ index: merged, meta: meta.length ? meta : files }, null, 2));
+  await atomicWrite(outFile, JSON.stringify({ index: merged, meta }, null, 2));
   console.log('wrote', outFile);
 }
 
