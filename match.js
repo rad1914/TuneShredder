@@ -97,22 +97,28 @@ async function main(argv = process.argv.slice(2)) {
 
   const { pairs, counts } = buildPairs(index);
   const results = analyze(pairs, counts, meta);
+  const baseDir = path.dirname(path.resolve(inPath));
 
   await fs.writeFile(outPath, JSON.stringify({ matches: results }, null, 2), 'utf8');
 
-  // move matched tracks to ./dupe
   const dupeDir = path.resolve('dupe');
   await fs.mkdir(dupeDir, { recursive: true });
 
   const moved = new Set();
   for (const r of results) {
-    const src = r.fileB;
+
+    if (r.score < 0.4) continue;
+
+    const src = path.resolve(baseDir, r.fileB);
     if (moved.has(src)) continue;
     try {
+      await fs.access(src);
       const dst = path.join(dupeDir, path.basename(src));
       await fs.rename(src, dst);
       moved.add(src);
-    } catch {}
+    } catch (e) {
+
+    }
   }
 
   console.log(`found ${results.length} pairs — wrote ${outPath}`);
