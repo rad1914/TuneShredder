@@ -1,134 +1,119 @@
-// @path: match.js
 import fs from 'node:fs/promises';
-import { fileURLToPath } from 'node:url';
-import path from 'node:path';
+import process from 'node:process';
+import { renderProgress } from './renderProgress.js';
 
-const getName = (meta, id) => {
-  const i = parseInt(id, 10) - 1;
-  return Array.isArray(meta) && meta[i] ? meta[i] : `track:${id}`;
-};
+const DEFAULT_MIN_MATCHES = 5;
+const pairKey = (a, b) => (a < b ? `${a}||${b}` : `${b}||${a}`);
 
-function buildPairs(index) {
-  const pairs = new Map();
-  const counts = Object.create(null);
+const loadIndex = async (p) => JSON.parse(await fs.readFile(p, 'utf8'));
 
-  for (const postings of Object.values(index)) {
-    if (!Array.isArray(postings) || postings.length === 0) continue;
+export async function findDuplicates(indexObj, { minMatches = DEFAULT_MIN_MATCHES, progressCb = () => {} } = {}) {
+  minMatches = Number(minMatches) || DEFAULT_MIN_MATCHES;
 
-    for (let i = 0; i < postings.length; i++) {
-      const [idA, tAraw] = postings[i];
-      const tA = Number(tAraw);
-      counts[idA] = (counts[idA] || 0) + 1;
+  const keys = Object.keys(indexObj);
+  const total = keys.length;
 
-      for (let j = i + 1; j < postings.length; j++) {
-        const [idB, tBraw] = postings[j];
-        if (idA === idB) continue;
-        const tB = Number(tBraw);
+  const pairCount = new Map();
+  for (let done = 0; done < total; done++) {
+    const k = keys[done];
+    const bucket = indexObj[k];
+    if (!bucket || bucket.length < 2) {
+      if (done % 200 === 0) progressCb(done, total, k);
+      continue;
+    }
 
-        let id1 = idA, id2 = idB;
-        let delta = Math.round(tB - tA);
-        if (id1 > id2) { [id1, id2] = [id2, id1]; delta = -delta; }
-
-        let inner = pairs.get(id1);
-        if (!inner) { inner = new Map(); pairs.set(id1, inner); }
-
-        let e = inner.get(id2);
-        if (!e) {
-          e = { deltas: new Map(), total: 0, bestDelta: 0, bestCount: 0, id1, id2 };
-          inner.set(id2, e);
-        }
-
-        const c = (e.deltas.get(delta) || 0) + 1;
-        e.deltas.set(delta, c);
-        e.total++;
-        if (c > e.bestCount) { e.bestCount = c; e.bestDelta = delta; }
+    for (let i = 0; i < bucket.length; i++) {
+      const a = bucket[i][0];
+      for (let j = i + 1; j < bucket.length; j++) {
+        const b = bucket[j][0];
+        if (a === b) continue;
+        const pk = pairKey(a, b);
+        pairCount.set(pk, (pairCount.get(pk) || 0) + 1);
       }
     }
+
+    if (done % 200 === 0) progressCb(done, total, k);
   }
 
-  return { pairs, counts };
-}
+  progressCb(total, total, 'filtering');
 
-function analyze(pairs, counts, meta = []) {
-  const nameMap = Object.create(null);
-  for (const k of Object.keys(counts)) nameMap[k] = getName(meta, k);
+  const candidates = new Set();
+  for (const [pk, cnt] of pairCount) if (cnt >= minMatches) candidates.add(pk);
+  if (!candidates.size) return [];
 
-  const out = [];
-  for (const [id1, inner] of pairs) {
-    for (const [id2, e] of inner) {
-      const a = e.id1, b = e.id2;
-      const hcA = counts[a] || 0, hcB = counts[b] || 0;
-      const minHC = Math.max(1, Math.min(hcA, hcB));
-      const score = e.bestCount / minHC;
+  const pairMap = new Map();
+  for (let done = 0; done < total; done++) {
+    const k = keys[done];
+    const bucket = indexObj[k];
+    if (!bucket || bucket.length < 2) {
+      if (done % 200 === 0) progressCb(done, total, k);
+      continue;
+    }
 
-      out.push({
-        pair: `${a}|${b}`,
-        idA: a, idB: b,
-        fileA: nameMap[a] || getName(meta, a),
-        fileB: nameMap[b] || getName(meta, b),
-        bestDelta: e.bestDelta,
-        bestCount: e.bestCount,
-        totalMatches: e.total,
-        hashCountA: hcA, hashCountB: hcB,
-        percentOfA: hcA ? (e.bestCount / hcA) * 100 : 0,
-        percentOfB: hcB ? (e.bestCount / hcB) * 100 : 0,
-        score
-      });
+    for (let i = 0; i < bucket.length; i++) {
+      const [a, posA] = bucket[i];
+      for (let j = i + 1; j < bucket.length; j++) {
+        const [b, posB] = bucket[j];
+        if (a === b) continue;
+
+        const pk = pairKey(a, b);
+        if (!candidates.has(pk)) continue;
+
+        let entry = pairMap.get(pk);
+        if (!entry) pairMap.set(pk, (entry = { offsets: new Map(), totalPairs: 0 }));
+
+        const off = posA - posB;
+        entry.offsets.set(off, (entry.offsets.get(off) || 0) + 1);
+        entry.totalPairs++;
+      }
+    }
+
+    if (done % 200 === 0) progressCb(done, total, k);
+  }
+
+  progressCb(total, total, 'finalizing');
+
+  const results = [];
+  for (const [pk, { offsets, totalPairs }] of pairMap) {
+    let bestOffset = 0, bestCount = 0, sharedHashes = 0;
+    for (const [off, cnt] of offsets) {
+      sharedHashes += cnt;
+      if (cnt > bestCount) (bestCount = cnt), (bestOffset = Number(off));
+    }
+    if (bestCount >= minMatches) {
+      const [a, b] = pk.split('||');
+      results.push({ a, b, bestOffset, bestCount, totalPairs, sharedHashes });
     }
   }
 
-  return out.sort((x, y) => y.score - x.score || y.bestCount - x.bestCount);
+  results.sort((x, y) => y.bestCount - x.bestCount || y.sharedHashes - x.sharedHashes);
+  return results;
 }
 
-async function main(argv = process.argv.slice(2)) {
-  if (argv.length < 1) {
-    console.error('usage: node match.js <index.json> [out.json]');
+async function mainCLI(argv) {
+  const [, , indexPath, outPath = 'duplicates.json', minMatchesArg] = argv;
+  if (!indexPath) {
+    console.error('usage: node match.js <index.json> [out.json] [minMatches]');
     process.exit(2);
   }
-  const inPath = argv[0], outPath = argv[1] || 'matches.json';
 
-  try { await fs.access(inPath); } catch {
-    console.error('index file not found:', inPath);
-    process.exit(1);
+  const data = await loadIndex(indexPath);
+  if (!data?.index) {
+    console.error('invalid index file: missing "index" property');
+    process.exit(3);
   }
 
-  const raw = JSON.parse(await fs.readFile(inPath, 'utf8'));
-  const index = raw.index || {}, meta = Array.isArray(raw.meta) ? raw.meta : [];
+  const minMatches = minMatchesArg ? parseInt(minMatchesArg, 10) : DEFAULT_MIN_MATCHES;
+  const progressCb = (done, total, label) => renderProgress(done, total, String(label || ''));
 
-  const { pairs, counts } = buildPairs(index);
-  const results = analyze(pairs, counts, meta);
-  const baseDir = path.dirname(path.resolve(inPath));
+  const results = await findDuplicates(data.index, { minMatches, progressCb });
+  await fs.writeFile(
+    outPath,
+    JSON.stringify({ generated: new Date().toISOString(), minMatches, results }, null, 2),
+    'utf8'
+  );
 
-  await fs.writeFile(outPath, JSON.stringify({ matches: results }, null, 2), 'utf8');
-
-  const dupeDir = path.resolve('dupe');
-  await fs.mkdir(dupeDir, { recursive: true });
-
-  const moved = new Set();
-  for (const r of results) {
-
-    if (r.score < 0.4) continue;
-
-    const src = path.resolve(baseDir, r.fileB);
-    if (moved.has(src)) continue;
-    try {
-      await fs.access(src);
-      const dst = path.join(dupeDir, path.basename(src));
-      await fs.rename(src, dst);
-      moved.add(src);
-    } catch (e) {
-
-    }
-  }
-
-  console.log(`found ${results.length} pairs — wrote ${outPath}`);
-  for (const r of results.slice(0, 10)) {
-    console.log(
-      `(${r.idA}) ${r.fileA} <-> (${r.idB}) ${r.fileB} | bestCount=${r.bestCount} total=${r.totalMatches} delta=${r.bestDelta} score=${r.score.toFixed(3)} %A=${r.percentOfA.toFixed(1)} %B=${r.percentOfB.toFixed(1)}`
-    );
-  }
+  console.log(`found ${results.length} duplicate pairs (minMatches=${minMatches}) -> ${outPath}`);
 }
 
-if (fileURLToPath(import.meta.url) === process.argv[1]) {
-  main().catch(e => { console.error(e); process.exit(1); });
-}
+if (import.meta.url === `file://${process.argv[1]}`) mainCLI(process.argv);

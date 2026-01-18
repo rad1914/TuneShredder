@@ -1,341 +1,169 @@
+// @path: index.js
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
-import { access } from 'node:fs/promises';
-import { setTimeout as sleep } from 'node:timers/promises';
 import path from 'node:path';
+import process from 'node:process';
 import os from 'node:os';
 import fft from 'fft-js';
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
+import { renderProgress } from './renderProgress.js';
 
-const SAMPLE_RATE = 22050;
-const CHANNELS = 1;
-const WINDOW = 4096;
-const HOP = 512;
-const TOP_PEAKS = 16;
-const TARGET_ZONE = 55;
-const MAX_PAIRS = 6;
-const FINGERPRINT_SECONDS = 45;
-const FREQ_Q = 10;
-const DT_Q = 3;
-
-// Prevent JSON explosion / memory death:
-// each hash key bucket will store at most N entries.
-const MAX_BUCKET = 250;
-const DEDUPE_BUCKET = true;
-
-const hann = (n) => {
-  const w = new Float32Array(n);
-  for (let i = 0; i < n; i++) w[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (n - 1)));
-  return w;
+const CFG = {
+  sr: 22050, ch: 1, win: 4096, hop: 512,
+  top: 16, zone: 55, pairs: 6,
+  sec: 45, fq: 10, dtq: 3, bucket: 250,
 };
-const hannWin = hann(WINDOW);
 
-const ffmpegToFloat32 = (file) =>
-  new Promise((resolve, reject) => {
-    const args = [
-      '-hide_banner', '-loglevel', 'error',
-      '-t', String(FINGERPRINT_SECONDS),
-      '-i', file,
-      '-ac', String(CHANNELS),
-      '-ar', String(SAMPLE_RATE),
-      '-f', 'f32le', '-'
-    ];
-    const p = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    const chunks = [];
-    let err = '';
-    p.stdout.on('data', (c) => chunks.push(c));
-    p.stderr.on('data', (c) => (err += c.toString()));
-    p.on('close', (code) => {
-      if (code !== 0) return reject(new Error('ffmpeg failed: ' + err.trim()));
-      const buf = Buffer.concat(chunks);
-      const float = new Float32Array(buf.buffer, buf.byteOffset, Math.floor(buf.length / 4));
-      resolve(new Float32Array(float));
-    });
+const hann = (() => {
+  const w = new Float32Array(CFG.win);
+  for (let i = 0; i < CFG.win; i++) w[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (CFG.win - 1)));
+  return w;
+})();
+
+const ffmpegF32 = (file) => new Promise((resolve, reject) => {
+  const p = spawn('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error',
+    '-t', String(CFG.sec),
+    '-i', file,
+    '-ac', String(CFG.ch),
+    '-ar', String(CFG.sr),
+    '-f', 'f32le',
+    '-',
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+  const chunks = [];
+  let err = '';
+  p.stdout.on('data', (c) => chunks.push(c));
+  p.stderr.on('data', (c) => (err += c));
+  p.on('close', (code) => {
+    if (code !== 0) return reject(new Error('ffmpeg failed: ' + err.trim()));
+    const buf = Buffer.concat(chunks);
+    const f = new Float32Array(buf.buffer, buf.byteOffset, (buf.length / 4) | 0);
+    resolve(new Float32Array(f));
   });
+});
 
-function stftMagnitudes(signal) {
-  const half = WINDOW >> 1;
-  const frames = [];
-  for (let pos = 0; pos + WINDOW <= signal.length; pos += HOP) {
-    const frame = new Float32Array(WINDOW);
-    for (let i = 0; i < WINDOW; i++) frame[i] = signal[pos + i] * hannWin[i];
+function stftMags(x) {
+  const half = CFG.win >> 1, out = [];
+  for (let pos = 0; pos + CFG.win <= x.length; pos += CFG.hop) {
+    const frame = new Float32Array(CFG.win);
+    for (let i = 0; i < CFG.win; i++) frame[i] = x[pos + i] * hann[i];
     const spec = fft.fft(frame);
     const mags = new Float32Array(half);
-    for (let i = 0; i < half; i++) {
-      const m = Math.hypot(spec[i][0], spec[i][1]);
-      mags[i] = Math.log1p(m);
-    }
-    frames.push(mags);
-  }
-  return frames;
-}
-
-function topKIndicesFloat32(arr, k) {
-  if (k <= 0) return [];
-  if (k === 1) {
-    let bi = -1, bv = -Infinity;
-    for (let i = 0; i < arr.length; i++) {
-      const v = arr[i];
-      if (v > bv) { bv = v; bi = i; }
-    }
-    return bi >= 0 ? [bi] : [];
-  }
-  if (k === 2) {
-    let i1 = -1, v1 = -Infinity;
-    let i2 = -1, v2 = -Infinity;
-    for (let i = 0; i < arr.length; i++) {
-      const v = arr[i];
-      if (v > v1) { v2 = v1; i2 = i1; v1 = v; i1 = i; }
-      else if (v > v2) { v2 = v; i2 = i; }
-    }
-    const out = [];
-    if (i1 >= 0) out.push(i1);
-    if (i2 >= 0) out.push(i2);
-    return out;
-  }
-
-  let i1 = -1, v1 = -Infinity;
-  let i2 = -1, v2 = -Infinity;
-  let i3 = -1, v3 = -Infinity;
-  for (let i = 0; i < arr.length; i++) {
-    const v = arr[i];
-    if (v > v1) { v3 = v2; i3 = i2; v2 = v1; i2 = i1; v1 = v; i1 = i; }
-    else if (v > v2) { v3 = v2; i3 = i2; v2 = v; i2 = i; }
-    else if (v > v3) { v3 = v; i3 = i; }
-  }
-  const out = [];
-  if (i1 >= 0) out.push(i1);
-  if (i2 >= 0) out.push(i2);
-  if (i3 >= 0) out.push(i3);
-  return out;
-}
-
-function topPeaksPerFrame(frames) {
-  const out = [];
-  for (const row of frames) {
-    const step = Math.max(1, Math.floor(row.length / 200));
-    const sample = [];
-    for (let i = 0; i < row.length; i += step) sample.push(row[i]);
-    sample.sort((a, b) => a - b);
-    const median = sample[Math.floor(sample.length / 2)] || 0;
-    const whitened = new Float32Array(row.length);
-    for (let i = 0; i < row.length; i++) {
-      const v = row[i] - median;
-      whitened[i] = v > 0 ? v : 0;
-    }
-    const idxs = topKIndicesFloat32(whitened, TOP_PEAKS);
-    const refined = idxs.map((i) => {
-      const L = whitened[i - 1] || 0;
-      const C = whitened[i] || 0;
-      const R = whitened[i + 1] || 0;
-      const denom = (L - 2 * C + R) || 1e-9;
-      const delta = 0.5 * (L - R) / denom;
-      return i + delta;
-    });
-    out.push(refined);
+    for (let i = 0; i < half; i++) mags[i] = Math.log1p(Math.hypot(spec[i][0], spec[i][1]));
+    out.push(mags);
   }
   return out;
 }
 
-function makeHashes(peaks, mags) {
-  const hashes = [];
-  for (let t = 0; t < peaks.length; t++) {
-    const anchors = peaks[t];
-    if (!anchors || !anchors.length) continue;
-    for (const f1 of anchors) {
-      const candidates = [];
-      for (let dt = 1; dt <= TARGET_ZONE; dt++) {
+function peaks(frames) {
+  return frames.map((row) =>
+    Array.from(row.keys())
+      .sort((a, b) => row[b] - row[a])
+      .slice(0, CFG.top)
+      .filter((i) => row[i] > 0)
+  );
+}
+
+function hashes(pk, mags) {
+  const out = [];
+  for (let t = 0; t < pk.length; t++) {
+    const a = pk[t];
+    if (!a?.length) continue;
+
+    for (const f1 of a) {
+      const cand = [];
+      for (let dt = 1; dt <= CFG.zone; dt++) {
         const t2 = t + dt;
-        if (t2 >= peaks.length) break;
-        for (const f2 of peaks[t2]) {
-          const b1 = Math.max(0, Math.min(mags[t].length - 1, Math.round(f1)));
-          const b2 = Math.max(0, Math.min(mags[t2].length - 1, Math.round(f2)));
-          const mag = (mags[t][b1] || 1e-9) * (mags[t2][b2] || 1e-9);
-          candidates.push({ f2, dt, mag });
+        if (t2 >= pk.length) break;
+        for (const f2 of pk[t2]) {
+          const b1 = Math.max(0, Math.min(mags[t].length - 1, f1 | 0));
+          const b2 = Math.max(0, Math.min(mags[t2].length - 1, f2 | 0));
+          cand.push({ f2, dt, mag: (mags[t][b1] || 1e-9) * (mags[t2][b2] || 1e-9) });
         }
       }
-      if (!candidates.length) continue;
-      candidates.sort((a, b) => b.mag - a.mag);
-      for (let i = 0; i < Math.min(MAX_PAIRS, candidates.length); i++) {
-        const { f2, dt } = candidates[i];
-        const q1 = Math.round(f1 / FREQ_Q);
-        const q2 = Math.round(f2 / FREQ_Q);
-        const qdt = Math.round(dt / DT_Q);
-        const key = `${q1}-${q2}-${qdt}`;
-        hashes.push({ key, t });
+      cand.sort((x, y) => y.mag - x.mag);
+      for (let i = 0; i < Math.min(CFG.pairs, cand.length); i++) {
+        const { f2, dt } = cand[i];
+        out.push({
+          key: `${Math.round(f1 / CFG.fq)}-${Math.round(f2 / CFG.fq)}-${Math.round(dt / CFG.dtq)}`,
+          t,
+        });
       }
-    }
-  }
-  return hashes;
-}
-
-function mapsFromHashes(hashes, trackId) {
-  const out = Object.create(null);
-  const seen = DEDUPE_BUCKET ? Object.create(null) : null;
-
-  for (const { key, t } of hashes) {
-    const bucket = (out[key] ||= []);
-
-    if (bucket.length >= MAX_BUCKET) continue;
-
-    if (DEDUPE_BUCKET) {
-      // quantize time a bit so tiny float jitter doesn't create infinite "unique" entries
-      const tq = Math.round(t / 2) * 2;
-      const sig = `${trackId}|${tq}`;
-      if ((seen[key] ||= new Set()).has(sig)) continue;
-      seen[key].add(sig);
-      bucket.push([trackId, tq]);
-    } else {
-      bucket.push([trackId, t]);
     }
   }
   return out;
 }
 
-async function runWorkerFingerprint(filePath, trackId) {
-  return new Promise((resolve, reject) => {
-    const worker = new Worker(new URL(import.meta.url), {
-      workerData: { filePath, trackId }
-    });
-
-    worker.once('message', (msg) => {
-      if (msg && msg.ok) resolve(msg.map);
-      else reject(new Error(msg?.error || 'worker failed'));
-    });
-
-    worker.once('error', reject);
-
-    worker.once('exit', (code) => {
-      if (code !== 0) reject(new Error(`worker exit ${code}`));
-    });
-  });
+function toMap(hs, id) {
+  const m = Object.create(null);
+  for (const { key, t } of hs) {
+    const b = (m[key] ||= []);
+    if (b.length < CFG.bucket) b.push([id, t]);
+  }
+  return m;
 }
 
-async function fingerprintPath(filePath, trackId) {
-  const float = await ffmpegToFloat32(filePath);
-  const spec = stftMagnitudes(float);
-  const peaks = topPeaksPerFrame(spec);
-  const hashes = makeHashes(peaks, spec);
-  return mapsFromHashes(hashes, trackId);
+async function fingerprint(file, id) {
+  const x = await ffmpegF32(file);
+  const mags = stftMags(x);
+  return toMap(hashes(peaks(mags), mags), id);
 }
 
-async function atomicWrite(filePath, data) {
-  const tmp = `${filePath}.tmp`;
-  await fs.writeFile(tmp, data, 'utf8');
-  await fs.rename(tmp, filePath);
-}
+const atomicWrite = async (p, s) => {
+  const tmp = p + '.tmp';
+  await fs.writeFile(tmp, s, 'utf8');
+  await fs.rename(tmp, p);
+};
 
-function makeHotWriter(outFile, getPayload) {
-  let pending = false;
-  let writing = false;
-
-  const flush = async () => {
-    if (writing) return;
-    if (!pending) return;
-    writing = true;
-    pending = false;
-    try {
-      await atomicWrite(outFile, JSON.stringify(getPayload()));
-    } finally {
-      writing = false;
-      if (pending) await flush();
-    }
-  };
-
-  const markDirty = () => {
-    pending = true;
-    queueMicrotask(flush);
-  };
-
-  return { markDirty, flush };
-}
+const runWorker = (filePath, trackId) => new Promise((resolve, reject) => {
+  const w = new Worker(new URL(import.meta.url), { workerData: { filePath, trackId } });
+  w.once('message', (m) => (m?.ok ? resolve(m.map) : reject(new Error(m?.error || 'worker failed'))));
+  w.once('error', reject);
+  w.once('exit', (c) => c === 0 || reject(new Error('worker exit ' + c)));
+});
 
 export async function buildIndex(dir, outFile = 'index.json') {
   const files = (await fs.readdir(dir)).filter((n) => /\.(wav|mp3|flac|m4a|ogg|opus)$/i.test(n));
-  let merged = Object.create(null);
-  let meta = [];
+  const merged = Object.create(null);
+  const meta = [];
+  let done = 0, idx = 0;
 
-  try {
-    await access(outFile);
-    const prev = JSON.parse(await fs.readFile(outFile, 'utf8'));
-    if (prev && typeof prev === 'object') {
-      if (prev.index && typeof prev.index === 'object') merged = prev.index;
-      if (Array.isArray(prev.meta)) meta = prev.meta.filter((x) => typeof x === 'string');
+  const write = () => atomicWrite(outFile, JSON.stringify({ index: merged, meta }));
+  const merge = (map) => {
+    for (const k in map) {
+      const dst = (merged[k] ||= []);
+      const src = map[k];
+      for (let j = 0; j < src.length && dst.length < CFG.bucket; j++) dst.push(src[j]);
     }
-  } catch {
-
-  }
-
-  const done = new Set(meta);
-
-  // Only write progress meta frequently; full index only once at the end.
-  const hot = makeHotWriter(outFile, () => ({ meta }));
-
-  const concurrency = Math.max(1, Math.min(os.cpus().length, 8));
-  let nextIndex = 0;
-  let processed = 0;
-
-  const updateProgress = (name, skipped = false) => {
-    const w = 30;
-    const filled = Math.round(((processed) / files.length) * w || 0);
-    process.stdout.write(
-      `\rProcessing: [${'='.repeat(filled)}${' '.repeat(w - filled)}] ${processed}/${files.length}${skipped ? ' (skipped)' : ''} | ${name}`
-    );
   };
 
-  const workerLoop = async () => {
-    while (true) {
-      const i = nextIndex++;
-      if (i >= files.length) break;
+  renderProgress(done, files.length, '');
+  const conc = Math.max(1, Math.min(os.cpus().length || 1, files.length));
 
-      const name = files[i];
-
-      if (done.has(name)) {
-        processed++;
-        updateProgress(name, true);
-        continue;
-      }
-
+  const worker = async () => {
+    for (;;) {
+      const name = files[idx++];
+      if (!name) return;
       try {
-        process.stdout.write(`\rTrack: ${name}`);
-        const map = await runWorkerFingerprint(path.join(dir, name), name);
-        if (map) {
-          for (const k of Object.keys(map)) {
-            const dst = (merged[k] ||= []);
-            // merge but cap to MAX_BUCKET to prevent JSON/string blow-up
-            const src = map[k];
-            for (let j = 0; j < src.length && dst.length < MAX_BUCKET; j++) {
-              dst.push(src[j]);
-            }
-          }
-          meta.push(name);
-          done.add(name);
-          hot.markDirty();
-        }
-      } catch (e) {
-        console.error('\nskip', name, e.message);
-      }
-
-      processed++;
-      updateProgress(name);
+        merge(await runWorker(path.join(dir, name), name));
+        meta.push(name);
+      } catch {}
+      done++;
+      renderProgress(done, files.length, name);
+      await write();
     }
   };
 
-  await Promise.all(Array.from({ length: concurrency }, () => workerLoop()));
-
-  process.stdout.write('\n');
-  await hot.flush();
-  // one final write with the full (possibly large) index
-  await atomicWrite(outFile, JSON.stringify({ index: merged, meta }));
-  console.log('wrote', outFile);
+  await Promise.all(Array.from({ length: conc }, worker));
+  await write();
 }
 
 if (!isMainThread) {
   (async () => {
     try {
       const { filePath, trackId } = workerData;
-      const map = await fingerprintPath(filePath, trackId);
-      parentPort.postMessage({ ok: true, map });
+      parentPort.postMessage({ ok: true, map: await fingerprint(filePath, trackId) });
     } catch (e) {
       parentPort.postMessage({ ok: false, error: e?.message || String(e) });
     }
@@ -344,17 +172,14 @@ if (!isMainThread) {
 
 if (isMainThread && import.meta.url === `file://${process.argv[1]}`) {
   (async () => {
-    const [, , cmd, a, b] = process.argv;
-    if (cmd === 'build' && a) {
-      try {
-        await buildIndex(a, b || 'index.json');
-      } catch (e) {
-        console.error(e);
-        process.exit(1);
-      }
-    } else {
+    const [, , cmd, dir, out] = process.argv;
+    if (cmd !== 'build' || !dir) {
       console.error('usage: node fingerprint.js build <dir> [out.json]');
       process.exit(2);
     }
-  })();
+    await buildIndex(dir, out || 'index.json');
+  })().catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
 }

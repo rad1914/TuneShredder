@@ -1,0 +1,126 @@
+{
+  "generated": "2026-01-18T18:12:40.852Z",
+  "minMatches": 5,
+  "results": [
+    {
+      "a": "Venture of Tonalamatl.flac",
+      "b": "natlan (2).mp3",
+      "bestOffset": 318,
+      "bestCount": 69957,
+      "totalPairs": 1286716,
+      "sharedHashes": 1286716
+    },
+    {
+      "a": "1-La Noche Mas Linda.opus",
+      "b": "1AUD-20250331-WA0028.opus",
+      "bestOffset": 496,
+      "bestCount": 24195,
+      "totalPairs": 1599849,
+      "sharedHashes": 1599849
+    },
+    {
+      "a": "1-La Noche Mas Linda.opus",
+      "b": "nalan (Extend).mp3",
+      "bestOffset": 846,
+      "bestCount": 12472,
+      "totalPairs": 379559,
+      "sharedHashes": 379559
+    },
+    {
+      "a": "1AUD-20250331-WA0028.opus",
+      "b": "Venture of Tonalamatl.flac",
+      "bestOffset": 1629,
+      "bestCount": 11690,
+      "totalPairs": 2323425,
+      "sharedHashes": 2323425
+    },
+    {
+      "a": "1-La Noche Mas Linda.opus",
+      "b": "Venture of Tonalamatl.flac",
+      "bestOffset": 49,
+      "bestCount": 7096,
+      "totalPairs": 517096,
+      "sharedHashes": 517096
+    },
+    {
+      "a": "nalan (Extend).mp3",
+      "b": "natlan (Extend) (6).mp3",
+      "bestOffset": 0,
+      "bestCount": 6045,
+      "totalPairs": 1655314,
+      "sharedHashes": 1655314
+    },
+    {
+      "a": "Venture of Tonalamatl.flac",
+      "b": "nalan (Extend).mp3",
+      "bestOffset": 242,
+      "bestCount": 5493,
+      "totalPairs": 1570001,
+      "sharedHashes": 1570001
+    },
+    {
+      "a": "1-La Noche Mas Linda.opus",
+      "b": "natlan (Extend) (6).mp3",
+      "bestOffset": 491,
+      "bestCount": 3710,
+      "totalPairs": 77220,
+      "sharedHashes": 77220
+    },
+    {
+      "a": "1AUD-20250331-WA0028.opus",
+      "b": "natlan (Extend) (6).mp3",
+      "bestOffset": 76,
+      "bestCount": 3538,
+      "totalPairs": 439727,
+      "sharedHashes": 439727
+    },
+    {
+      "a": "natlan (2).mp3",
+      "b": "natlan (Extend) (6).mp3",
+      "bestOffset": 70,
+      "bestCount": 3313,
+      "totalPairs": 673456,
+      "sharedHashes": 673456
+    },
+    {
+      "a": "nalan (Extend).mp3",
+      "b": "natlan (2).mp3",
+      "bestOffset": -545,
+      "bestCount": 3217,
+      "totalPairs": 1138184,
+      "sharedHashes": 1138184
+    },
+    {
+      "a": "1AUD-20250331-WA0028.opus",
+      "b": "nalan (Extend).mp3",
+      "bestOffset": -331,
+      "bestCount": 2948,
+      "totalPairs": 897547,
+      "sharedHashes": 897547
+    },
+    {
+      "a": "Venture of Tonalamatl.flac",
+      "b": "natlan (Extend) (6).mp3",
+      "bestOffset": -1345,
+      "bestCount": 2480,
+      "totalPairs": 565973,
+      "sharedHashes": 565973
+    },
+    {
+      "a": "1AUD-20250331-WA0028.opus",
+      "b": "natlan (2).mp3",
+      "bestOffset": 183,
+      "bestCount": 1966,
+      "totalPairs": 333916,
+      "sharedHashes": 333916
+    },
+    {
+      "a": "1-La Noche Mas Linda.opus",
+      "b": "natlan (2).mp3",
+      "bestOffset": -1225,
+      "bestCount": 1955,
+      "totalPairs": 25951,
+      "sharedHashes": 25951
+    }
+  ]
+}
