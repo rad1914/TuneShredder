@@ -109,7 +109,19 @@ async function fingerprint(file, id) {
   return toMap(hashes(peaks(mags), mags), id);
 }
 
-const atomicWrite = async (p, s) => { await fs.writeFile(p + '.tmp', s, 'utf8'); await fs.rename(p + '.tmp', p); };
+const atomicWrite = async (p, s) => {
+
+  const tmp = `${p}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+  try {
+    await fs.writeFile(tmp, s, 'utf8');
+
+    await fs.rename(tmp, p);
+  } catch (err) {
+
+    try { await fs.unlink(tmp); } catch (e) {  }
+    throw err;
+  }
+};
 
 const runWorker = (filePath, trackId) => new Promise((resolve, reject) => {
   const w = new Worker(new URL(import.meta.url), { workerData: { filePath, trackId } });
@@ -131,7 +143,7 @@ export async function buildIndex(dir, outFile = 'index.json') {
   } catch (e) { }
 
   let idx = 0, done = 0;
-  const conc = Math.max(1, Math.min(os.cpus().length || 1, files.length));
+  const conc = Math.max(1, Math.min(os.cpus().length || 7, files.length));
   const merge = map => { for (const k in map) { const dst = (merged[k] ||= []), src = map[k]; for (let j = 0; j < src.length && dst.length < CFG.bucket; j++) dst.push(src[j]); } };
 
   console.log(`workers=${conc} files=${files.length}`);
