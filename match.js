@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import process from 'node:process';
 import { renderProgress } from './renderProgress.js';
 
-const DEFAULTS = { minMatches: 3, minRatio: 0.5, progressInterval: 1200, maxBucket: 200 };
+const DEFAULTS = { minMatches: 3, minRatio: 0.5, progressInterval: 600, maxBucket: 200 };
 const PAIR_SEP = '\u0000';
 const pairKey = (a, b) => (a < b ? `${a}${PAIR_SEP}${b}` : `${b}${PAIR_SEP}${a}`);
 const splitPairKey = (pk) => pk.split(PAIR_SEP);
@@ -81,7 +81,7 @@ export async function findDuplicates(indexObj, opts = {}) {
   const candidates = new Set([...pairCount.entries()].filter(([,cnt]) => cnt >= minM).map(([pk]) => pk));
   if (!candidates.size) return [];
 
-  const pairMap = new Map(); // pk -> { offsets: Map, totalPairs }
+  const pairMap = new Map();
   for (let i = 0; i < total; i++) {
     const k = keys[i];
     const bucket = indexObj[k];
