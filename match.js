@@ -38,8 +38,20 @@ function dedupeIndex(idx, maxBucket = CFG.bucket) {
     const dst = [];
     for (let i = 0; i < bucket.length && dst.length < maxBucket; i++) {
       const e = bucket[i];
-      const id = Array.isArray(e) ? e[0] : e;
-      const pos = Array.isArray(e) ? e[1] : 0;
+
+      let id, pos;
+      if (Array.isArray(e)) {
+        id = e[0];
+        if (Array.isArray(e[1])) {
+
+          pos = Number.isFinite(Number(e[1][0])) ? Number(e[1][0]) : 0;
+        } else {
+          pos = Number.isFinite(Number(e[1])) ? Number(e[1]) : 0;
+        }
+      } else {
+        id = e;
+        pos = 0;
+      }
       const pk = `${id}\u0001${pos}`;
       if (seenPair.has(pk)) continue;
       if (seenId.has(id)) { seenPair.add(pk); continue; }
@@ -80,12 +92,17 @@ export async function findDuplicates(indexObj, opts = {}) {
     const dst = [];
     for (let j = 0; j < bucket.length && dst.length < maxBucket; j++) {
       const e = bucket[j];
+
       if (Array.isArray(e)) {
         const id = e[0];
-        const pos = Number.isFinite(Number(e[1])) ? Number(e[1]) : 0;
+        let pos = 0;
+        if (Array.isArray(e[1])) {
+          pos = Number.isFinite(Number(e[1][0])) ? Number(e[1][0]) : 0;
+        } else {
+          pos = Number.isFinite(Number(e[1])) ? Number(e[1]) : 0;
+        }
         dst.push([id, pos]);
       } else {
-
         dst.push([e, 0]);
       }
     }
@@ -206,5 +223,4 @@ async function mainCLI(argv) {
     process.exit(5);
   }
 }
-
 if (import.meta.url === `file://${process.argv[1]}`) mainCLI(process.argv);
