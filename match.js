@@ -1,9 +1,16 @@
 // @path: match.js
 import fs from 'node:fs/promises';
 import process from 'node:process';
+import path from 'node:path';
 import { renderProgress } from './renderProgress.js';
 
-const DEFAULTS = { minMatches: 3, minRatio: 0.5, progressInterval: 600, maxBucket: 200 };
+const CFG = {
+  bucket: 250,
+  minMatches: 3,
+  minRatio: 0.5,
+  progressInterval: 600,
+};
+
 const PAIR_SEP = '\u0000';
 const pairKey = (a, b) => (a < b ? `${a}${PAIR_SEP}${b}` : `${b}${PAIR_SEP}${a}`);
 const splitPairKey = (pk) => pk.split(PAIR_SEP);
@@ -14,7 +21,15 @@ const loadIndex = async (p) => {
   return parsed?.index ?? parsed;
 };
 
-function dedupeIndex(idx, maxBucket = DEFAULTS.maxBucket) {
+async function atomicWrite(filePath, data, encoding = 'utf8') {
+  const dir = path.dirname(filePath);
+  const base = path.basename(filePath);
+  const tmpName = path.join(dir, `.${base}.tmp-${process.pid}-${Date.now()}`);
+  await fs.writeFile(tmpName, data, encoding);
+  await fs.rename(tmpName, filePath);
+}
+
+function dedupeIndex(idx, maxBucket = CFG.bucket) {
   const out = Object.create(null);
   for (const [k, bucket] of Object.entries(idx)) {
     if (!bucket || bucket.length === 0) continue;
@@ -41,26 +56,53 @@ export async function findDuplicates(indexObj, opts = {}) {
   if (!indexObj || typeof indexObj !== 'object') throw new TypeError('indexObj must be an object');
 
   const {
-    minMatches = DEFAULTS.minMatches,
-    minRatio = DEFAULTS.minRatio,
+    minMatches = CFG.minMatches,
+    minRatio = CFG.minRatio,
     progressCb = () => {},
-    progressInterval = DEFAULTS.progressInterval,
+    progressInterval = CFG.progressInterval,
+    maxBucket = CFG.bucket,
   } = opts;
 
-  const minM = Number(minMatches) || DEFAULTS.minMatches;
+  const minM = Number(minMatches) || CFG.minMatches;
   let ratio = Number(minRatio);
-  if (!Number.isFinite(ratio) || ratio <= 0 || ratio > 1) ratio = DEFAULTS.minRatio;
+  if (!Number.isFinite(ratio) || ratio <= 0 || ratio > 1) ratio = CFG.minRatio;
 
   const keys = Object.keys(indexObj);
   const total = keys.length;
-  const pairCount = new Map();
-  let nonEmpty = 0;
-
+  const normalized = Object.create(null);
   for (let i = 0; i < total; i++) {
     const k = keys[i];
     const bucket = indexObj[k];
-    if (!bucket || bucket.length < 2) {
+    if (!bucket || bucket.length === 0) {
       if ((i % progressInterval) === 0) progressCb(i, total, k);
+      continue;
+    }
+    const dst = [];
+    for (let j = 0; j < bucket.length && dst.length < maxBucket; j++) {
+      const e = bucket[j];
+      if (Array.isArray(e)) {
+        const id = e[0];
+        const pos = Number.isFinite(Number(e[1])) ? Number(e[1]) : 0;
+        dst.push([id, pos]);
+      } else {
+
+        dst.push([e, 0]);
+      }
+    }
+    if (dst.length) normalized[k] = dst;
+    if ((i % progressInterval) === 0) progressCb(i, total, k);
+  }
+
+  progressCb(total, total, 'counting');
+
+  const pairCount = new Map();
+  let nonEmpty = 0;
+  const nKeys = Object.keys(normalized);
+  for (let i = 0; i < nKeys.length; i++) {
+    const k = nKeys[i];
+    const bucket = normalized[k];
+    if (!bucket || bucket.length < 2) {
+      if ((i % progressInterval) === 0) progressCb(i, nKeys.length, k);
       continue;
     }
     nonEmpty++;
@@ -73,20 +115,24 @@ export async function findDuplicates(indexObj, opts = {}) {
         pairCount.set(pk, (pairCount.get(pk) || 0) + 1);
       }
     }
-    if ((i % progressInterval) === 0) progressCb(i, total, k);
+    if ((i % progressInterval) === 0) progressCb(i, nKeys.length, k);
   }
 
-  progressCb(total, total, 'filtering');
+  progressCb(nKeys.length, nKeys.length, 'filtering');
 
-  const candidates = new Set([...pairCount.entries()].filter(([,cnt]) => cnt >= minM).map(([pk]) => pk));
+  const candidates = new Set(
+    [...pairCount.entries()]
+      .filter(([, cnt]) => cnt >= minM)
+      .map(([pk]) => pk)
+  );
   if (!candidates.size) return [];
 
   const pairMap = new Map();
-  for (let i = 0; i < total; i++) {
-    const k = keys[i];
-    const bucket = indexObj[k];
+  for (let i = 0; i < nKeys.length; i++) {
+    const k = nKeys[i];
+    const bucket = normalized[k];
     if (!bucket || bucket.length < 2) {
-      if ((i % progressInterval) === 0) progressCb(i, total, k);
+      if ((i % progressInterval) === 0) progressCb(i, nKeys.length, k);
       continue;
     }
     for (let aI = 0; aI < bucket.length; aI++) {
@@ -103,10 +149,10 @@ export async function findDuplicates(indexObj, opts = {}) {
         entry.totalPairs++;
       }
     }
-    if ((i % progressInterval) === 0) progressCb(i, total, k);
+    if ((i % progressInterval) === 0) progressCb(i, nKeys.length, k);
   }
 
-  progressCb(total, total, 'finalizing');
+  progressCb(nKeys.length, nKeys.length, 'finalizing');
 
   const results = [];
   for (const [pk, { offsets, totalPairs }] of pairMap) {
@@ -137,17 +183,23 @@ async function mainCLI(argv) {
 
   if (!index || typeof index !== 'object') { console.error('invalid index file'); process.exit(4); }
 
-  const minMatches = minMatchesArg ? parseInt(minMatchesArg, 10) : DEFAULTS.minMatches;
-  const minRatio = minRatioArg ? Number(minRatioArg) : DEFAULTS.minRatio;
-  const maxBucket = maxBucketArg ? parseInt(maxBucketArg, 10) : DEFAULTS.maxBucket;
+  const minMatches = minMatchesArg ? parseInt(minMatchesArg, 10) : CFG.minMatches;
+  const minRatio = minRatioArg ? Number(minRatioArg) : CFG.minRatio;
+  const maxBucket = maxBucketArg ? parseInt(maxBucketArg, 10) : CFG.bucket;
 
   const deduped = dedupeIndex(index, maxBucket);
   const progressCb = (done, total, label) => renderProgress(done, total, String(label || ''));
 
   try {
-    const results = await findDuplicates(deduped, { minMatches, minRatio, progressCb, progressInterval: DEFAULTS.progressInterval });
+    const results = await findDuplicates(deduped, {
+      minMatches,
+      minRatio,
+      maxBucket,
+      progressCb,
+      progressInterval: CFG.progressInterval,
+    });
     const payload = { generated: new Date().toISOString(), minMatches, minRatio, maxBucket, results };
-    await fs.writeFile(outPath, JSON.stringify(payload, null, 2), 'utf8');
+    await atomicWrite(outPath, JSON.stringify(payload, null, 2), 'utf8');
     console.log(`found ${results.length} duplicate pairs -> ${outPath}`);
   } catch (e) {
     console.error('error while finding duplicates:', e?.message || String(e));

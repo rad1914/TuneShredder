@@ -1,16 +1,16 @@
 {
-  "generated": "2026-01-18T20:52:32.019Z",
+  "generated": "2026-01-18T22:18:36.009Z",
   "minMatches": 3,
   "minRatio": 0.5,
-  "maxBucket": 300,
+  "maxBucket": 250,
   "results": [
     {
       "a": "1Lancer's Theme (feat. Orenji Music) - The Musical Ghost.m4a (Remix).mp3",
       "b": "ueueu1Lancer's Theme (feat. Orenji Music) - The Musical Ghost.m4a (Remix).m4a",
       "bestOffset": 0,
-      "bestCount": 14542,
-      "totalPairs": 14992,
-      "sharedHashes": 14992
+      "bestCount": 12838,
+      "totalPairs": 13232,
+      "sharedHashes": 13232
     }
   ]
 }
