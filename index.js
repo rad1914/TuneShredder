@@ -1,5 +1,4 @@
 // @path: index.js
-
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -115,8 +114,19 @@ const runWorker = (filePath, trackId) => new Promise((resolve, reject) => {
 });
 
 export async function buildIndex(dir, outFile = 'index.json') {
-  const files = (await fs.readdir(dir)).filter(n => /\.(wav|mp3|flac|m4a|ogg|opus)$/i.test(n));
-  const merged = Object.create(null), meta = [];
+  let files = (await fs.readdir(dir)).filter(n => /\.(wav|mp3|flac|m4a|ogg|opus)$/i.test(n));
+  let merged = Object.create(null), meta = [];
+
+  try {
+    const existing = await fs.readFile(outFile, 'utf8');
+    const parsed = JSON.parse(existing || '{}');
+    if (parsed && parsed.index) merged = parsed.index;
+    if (Array.isArray(parsed.meta)) meta = parsed.meta.slice();
+    if (meta.length) {
+      const skip = new Set(meta);
+      files = files.filter(f => !skip.has(f));
+    }
+  } catch (e) {  }
   let idx = 0, done = 0;
   const conc = Math.max(1, Math.min(os.cpus().length || 1, files.length));
   const merge = map => { for (const k in map) { const dst = (merged[k] ||= []), src = map[k]; for (let j=0;j<src.length && dst.length<CFG.bucket;j++) dst.push(src[j]); } };
