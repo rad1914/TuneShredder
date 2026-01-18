@@ -118,7 +118,8 @@ export async function buildIndex(dir, outFile = 'index.json') {
   const files = (await fs.readdir(dir)).filter(n => /\.(wav|mp3|flac|m4a|ogg|opus)$/i.test(n));
   const merged = Object.create(null), meta = [];
   let idx = 0, done = 0;
-  const conc = Math.max(1, Math.min(os.cpus().length || 1, files.length));
+
+  const conc = Math.max(1, Math.min(2, os.cpus().length || 1, files.length));
   const merge = map => { for (const k in map) { const dst = (merged[k] ||= []), src = map[k]; for (let j=0;j<src.length && dst.length<CFG.bucket;j++) dst.push(src[j]); } };
   console.log(`workers=${conc} files=${files.length}`);
   const worker = async () => {
@@ -126,7 +127,9 @@ export async function buildIndex(dir, outFile = 'index.json') {
       const name = files[idx++]; if (!name) return;
       try { merge(await runWorker(path.join(dir, name), name)); meta.push(name); }
       catch (e) {  }
-      done++; if (done % 16 === 0) await atomicWrite(outFile, JSON.stringify({ index: merged, meta }));
+      done++;
+
+      if (done % 6 === 0) await atomicWrite(outFile, JSON.stringify({ index: merged, meta }));
       console.log(`progress ${done}/${files.length} - ${name}`);
     }
   };
