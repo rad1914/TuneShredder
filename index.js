@@ -5,13 +5,14 @@ import path from 'node:path';
 import process from 'node:process';
 import os from 'node:os';
 import fft from 'fft-js';
+import FFT from 'fft.js';
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
 import { renderProgress } from './renderProgress.js';
 
 const CFG = {
   sr: 22050, ch: 1, win: 4096, hop: 512,
-  top: 16, zone: 55, pairs: 6,
-  sec: 45, fq: 10, dtq: 3, bucket: 250,
+  top: 24, zone: 55, pairs: 6,
+  sec: 45, fq: 6, dtq: 2, bucket: 250,
 };
 
 const hann = (() => {
@@ -44,49 +45,97 @@ const ffmpegF32 = (file) => new Promise((resolve, reject) => {
 });
 
 function stftMags(x) {
-  const half = CFG.win >> 1, out = [];
+
+  const half = CFG.win >> 1;
+  const nFrames = Math.max(0, Math.floor((x.length - CFG.win) / CFG.hop) + 1);
+  const out = new Array(nFrames);
+
+  const FFT_SIZE = CFG.win;
+  const fftPlan = new FFT(FFT_SIZE);
+  const complexOut = fftPlan.createComplexArray();
+  const realInput = new Float64Array(FFT_SIZE);
+  const magsBuf = new Float32Array(half);
+
+  let outIdx = 0;
   for (let pos = 0; pos + CFG.win <= x.length; pos += CFG.hop) {
-    const frame = new Float32Array(CFG.win);
-    for (let i = 0; i < CFG.win; i++) frame[i] = x[pos + i] * hann[i];
-    const spec = fft.fft(frame);
-    const mags = new Float32Array(half);
-    for (let i = 0; i < half; i++) mags[i] = Math.log1p(Math.hypot(spec[i][0], spec[i][1]));
-    out.push(mags);
+    for (let i = 0; i < CFG.win; i++) realInput[i] = x[pos + i] * hann[i];
+    fftPlan.realTransform(complexOut, realInput);
+    for (let b = 0; b < half; b++) {
+      const re = complexOut[b * 2] || 0;
+      const im = complexOut[b * 2 + 1] || 0;
+      magsBuf[b] = Math.log1p(Math.hypot(re, im));
+    }
+    out[outIdx++] = new Float32Array(magsBuf);
   }
   return out;
 }
 
+function topKIndices(row, K) {
+  const bestIdx = new Int32Array(K).fill(-1);
+  const bestVal = new Float32Array(K).fill(-Infinity);
+  for (let i = 0; i < row.length; i++) {
+    const v = row[i];
+    if (v <= 0) continue;
+
+    let minPos = 0;
+    for (let j = 1; j < K; j++) if (bestVal[j] < bestVal[minPos]) minPos = j;
+    if (v > bestVal[minPos]) {
+      bestVal[minPos] = v;
+      bestIdx[minPos] = i;
+    }
+  }
+  const res = [];
+  for (let j = 0; j < K; j++) if (bestIdx[j] !== -1) res.push(bestIdx[j]);
+  return res;
+}
+
 function peaks(frames) {
-  return frames.map((row) =>
-    Array.from(row.keys())
-      .sort((a, b) => row[b] - row[a])
-      .slice(0, CFG.top)
-      .filter((i) => row[i] > 0)
-  );
+  return frames.map((row) => topKIndices(row, CFG.top));
 }
 
 function hashes(pk, mags) {
   const out = [];
+
+  const quantPK = pk.map((arr) => (arr || []).map((f) => Math.round(f / CFG.fq)));
+
   for (let t = 0; t < pk.length; t++) {
-    const a = pk[t];
+    const a = quantPK[t];
     if (!a?.length) continue;
 
-    for (const f1 of a) {
-      const cand = [];
+    for (const f1q of a) {
+
+      const bestF = new Int32Array(CFG.pairs).fill(-1);
+      const bestDt = new Int32Array(CFG.pairs).fill(0);
+      const bestMag = new Float32Array(CFG.pairs).fill(-Infinity);
+
       for (let dt = 1; dt <= CFG.zone; dt++) {
         const t2 = t + dt;
         if (t2 >= pk.length) break;
-        for (const f2 of pk[t2]) {
-          const b1 = Math.max(0, Math.min(mags[t].length - 1, f1 | 0));
-          const b2 = Math.max(0, Math.min(mags[t2].length - 1, f2 | 0));
-          cand.push({ f2, dt, mag: (mags[t][b1] || 1e-9) * (mags[t2][b2] || 1e-9) });
+        for (const f2q of quantPK[t2]) {
+          const b1 = Math.min(mags[t].length - 1, Math.max(0, f1q));
+          const b2 = Math.min(mags[t2].length - 1, Math.max(0, f2q));
+          const score = (mags[t][b1] || 1e-9) * (mags[t2][b2] || 1e-9);
+
+          for (let s = 0; s < CFG.pairs; s++) {
+            if (score > bestMag[s]) {
+              for (let k = CFG.pairs - 1; k > s; k--) {
+                bestMag[k] = bestMag[k - 1];
+                bestF[k] = bestF[k - 1];
+                bestDt[k] = bestDt[k - 1];
+              }
+              bestMag[s] = score;
+              bestF[s] = f2q;
+              bestDt[s] = dt;
+              break;
+            }
+          }
         }
       }
-      cand.sort((x, y) => y.mag - x.mag);
-      for (let i = 0; i < Math.min(CFG.pairs, cand.length); i++) {
-        const { f2, dt } = cand[i];
+
+      for (let p = 0; p < CFG.pairs; p++) {
+        if (bestF[p] === -1) continue;
         out.push({
-          key: `${Math.round(f1 / CFG.fq)}-${Math.round(f2 / CFG.fq)}-${Math.round(dt / CFG.dtq)}`,
+          key: `${f1q}-${bestF[p]}-${Math.round(bestDt[p] / CFG.dtq)}`,
           t,
         });
       }
@@ -141,6 +190,14 @@ export async function buildIndex(dir, outFile = 'index.json') {
   renderProgress(done, files.length, '');
   const conc = Math.max(1, Math.min(os.cpus().length || 1, files.length));
 
+  let writeCounter = 0;
+  const WRITE_EVERY = 16;
+
+  const writeIfNeeded = async () => {
+    writeCounter++;
+    if (writeCounter % WRITE_EVERY === 0) await atomicWrite(outFile, JSON.stringify({ index: merged, meta }));
+  };
+
   const worker = async () => {
     for (;;) {
       const name = files[idx++];
@@ -151,7 +208,7 @@ export async function buildIndex(dir, outFile = 'index.json') {
       } catch {}
       done++;
       renderProgress(done, files.length, name);
-      await write();
+      await writeIfNeeded();
     }
   };
 
