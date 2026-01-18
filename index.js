@@ -1,3 +1,5 @@
+// @path: index.js
+
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -107,17 +109,7 @@ const atomicWrite = async (p, s) => { await fs.writeFile(p + '.tmp', s, 'utf8');
 
 const runWorker = (filePath, trackId) => new Promise((resolve, reject) => {
   const w = new Worker(new URL(import.meta.url), { workerData: { filePath, trackId } });
-  // Worker writes its result to a temp file and returns the path to avoid copying huge objects over postMessage.
-  w.once('message', async m => {
-    if (!m?.ok) return reject(new Error(m?.error || 'worker failed'));
-    try {
-      const data = await fs.readFile(m.file, 'utf8');
-      await fs.unlink(m.file).catch(() => {});
-      resolve(JSON.parse(data));
-    } catch (e) {
-      reject(e);
-    }
-  });
+  w.once('message', m => m?.ok ? resolve(m.map) : reject(new Error(m?.error || 'worker failed')));
   w.once('error', reject);
   w.once('exit', c => c === 0 || reject(new Error('worker exit ' + c)));
 });
@@ -134,7 +126,7 @@ export async function buildIndex(dir, outFile = 'index.json') {
       const name = files[idx++]; if (!name) return;
       try { merge(await runWorker(path.join(dir, name), name)); meta.push(name); }
       catch (e) {  }
-      done++; if (done % 1 === 0) await atomicWrite(outFile, JSON.stringify({ index: merged, meta }));
+      done++; if (done % 16 === 0) await atomicWrite(outFile, JSON.stringify({ index: merged, meta }));
       console.log(`progress ${done}/${files.length} - ${name}`);
     }
   };
@@ -146,12 +138,7 @@ if (!isMainThread) {
   (async () => {
     try {
       const { filePath, trackId } = workerData;
-      const map = await fingerprint(filePath, trackId);
-      // Write result to a temp file and return the filepath to the main thread.
-      const tmpFile = path.join(os.tmpdir(), `fingerprint_${encodeURIComponent(String(trackId))}_${Date.now()}.json`);
-      await fs.writeFile(tmpFile + '.tmp', JSON.stringify(map), 'utf8');
-      await fs.rename(tmpFile + '.tmp', tmpFile);
-      parentPort.postMessage({ ok: true, file: tmpFile });
+      parentPort.postMessage({ ok: true, map: await fingerprint(filePath, trackId) });
     } catch (e) {
       parentPort.postMessage({ ok: false, error: e?.message || String(e) });
     }
