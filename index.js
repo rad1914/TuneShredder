@@ -154,7 +154,7 @@ export async function buildIndex(dir, outFile = 'index.json') {
       } catch (e) {  }
       done++;
       if (done % 1 === 0) await atomicWrite(outFile, JSON.stringify({ index: merged, meta }));
-      console.log(`progress ${done}/${files.length} - ${name}`);
+      console.log(`progress: ${done}/${files.length} - ${name}`);
     }
   };
 
