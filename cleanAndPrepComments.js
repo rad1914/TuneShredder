@@ -13,7 +13,7 @@ function toPosixPath(path) {
 
 function getFileType(ext) {
   ext = ext.toLowerCase();
-  if (ext === '.js' || ext === '.kt' || ext === '.sh') return 'code';
+  if (ext === '.js' || ext === '.cjs' || ext === '.kt' || ext === '.sh') return 'code';
   if (ext === '.xml') return 'xml';
   if (ext === '.html') return 'html';
   return null;
