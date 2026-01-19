@@ -136,10 +136,7 @@ export async function buildIndex(dir,outFile='index.json'){
       const fid = Number(fidStr);
       const times = perFile[fid].sort((a,b)=>a-b);
       if (!times.length) continue;
-      const deltas = new Array(times.length);
-      deltas[0]=times[0];
-      for (let i=1;i<times.length;i++) deltas[i]=times[i]-times[i-1];
-      outList.push([fid,deltas]);
+      outList.push([fid,times]);
     }
     merged[k]=outList;
   }

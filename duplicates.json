@@ -1,16 +1,8 @@
 {
-  "generated": "2026-01-18T22:42:47.083Z",
-  "minMatches": 3,
-  "minRatio": 0.5,
-  "maxBucket": 250,
-  "results": [
-    {
-      "a": "0",
-      "b": "9",
-      "bestOffset": 0,
-      "bestCount": 12838,
-      "totalPairs": 13232,
-      "sharedHashes": 13232
-    }
-  ]
+  "generated": "2026-01-19T01:36:24.427Z",
+  "minMatches": 4,
+  "minRatio": 0.55,
+  "maxBucket": 200,
+  "dropAbove": 600,
+  "results": []
 }
