@@ -102,6 +102,8 @@ export async function buildIndex(dir, out='index.json'){
     index=j.index||index; meta=j.meta||meta;
   }catch{}
 
+  // write less frequently to avoid repeated stringify/rename on every file (reduces V8 heap churn)
+  const SAVE_INTERVAL = 10;
   const done=new Set(meta);
   const files=(await fs.readdir(dir))
     .filter(f=>/\.(wav|mp3|flac|m4a|ogg|opus)$/i.test(f))
@@ -110,19 +112,22 @@ export async function buildIndex(dir, out='index.json'){
   for(const name of files){
     const id=meta.length;
     try{
-      const map=await fingerprint(path.join(dir,name), id);
-      // write shard (one JSON object per line) for incremental processing
-      await fs.appendFile('shard.json', JSON.stringify(map) + '\n');
-      
-      for(const k in map){
+      const m=await fingerprint(path.join(dir,name), id);
+      for(const k in m){
         const d=index[k] ||= [];
-        for(const x of map[k]) if(d.length<CFG.bucket) d.push(x);
+        for(const x of m[k]) if(d.length<CFG.bucket) d.push(x);
       }
       meta.push(name);
     }catch(e){ console.error('fail', name, e.message); }
-    await atomicWrite(out, JSON.stringify({ index, meta }));
-    console.log('done', name);
+
+    // persist periodically (every SAVE_INTERVAL files) to avoid constant full-json churn
+    if (meta.length % SAVE_INTERVAL === 0) {
+      try { await atomicWrite(out, JSON.stringify({ index, meta })); } catch(e){ console.error('write failed', e && e.message); }
+    }
+    console.log('processed', name);
   }
+  // final write after loop
+  await atomicWrite(out, JSON.stringify({ index, meta }));
 }
 
 if(import.meta.url===`file://${process.argv[1]}`){
