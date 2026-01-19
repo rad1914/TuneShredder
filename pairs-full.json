@@ -1,0 +1,56 @@
+{
+  "summary": {
+    "bucketsTotal": 94816,
+    "nonArrayBuckets": 0,
+    "emptyBuckets": 0,
+    "singleBuckets": 73019,
+    "multiBuckets": 21797,
+    "maxBucketLen": 3,
+    "totalEntries": 120378,
+    "validEntries": 120378,
+    "badShape": 0,
+    "badTimes": 0,
+    "maxTimesLen": 250
+  },
+  "totalPairs": 3,
+  "topFiles": [
+    {
+      "id": 1,
+      "occurrences": 48456,
+      "name": "genshin1.mp3"
+    },
+    {
+      "id": 2,
+      "occurrences": 44610,
+      "name": "imagine dragons.opus"
+    },
+    {
+      "id": 0,
+      "occurrences": 27312,
+      "name": "genshin(cropped).m4a"
+    }
+  ],
+  "pairs": [
+    {
+      "a": 0,
+      "b": 1,
+      "count": 19381,
+      "nameA": "genshin(cropped).m4a",
+      "nameB": "genshin1.mp3"
+    },
+    {
+      "a": 1,
+      "b": 2,
+      "count": 5541,
+      "nameA": "genshin1.mp3",
+      "nameB": "imagine dragons.opus"
+    },
+    {
+      "a": 0,
+      "b": 2,
+      "count": 4405,
+      "nameA": "genshin(cropped).m4a",
+      "nameB": "imagine dragons.opus"
+    }
+  ]
+}

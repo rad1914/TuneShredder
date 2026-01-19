@@ -1,3 +1,4 @@
+// e.cjs
 const fs = require("fs");
 const path = require("path");
 
@@ -6,172 +7,125 @@ const idx = raw.index || raw;
 const meta = raw.meta || [];
 const keys = Object.keys(idx);
 
-console.log("=".repeat(60));
-console.log(" 🔍 INDEX DIAGNOSTIC REPORT");
-console.log("=".repeat(60));
+if (!keys.length) process.exit(console.error("EMPTY INDEX"), 1);
 
-console.table([{
-  "Has Wrapper": !!raw.index,
-  "Meta Array": Array.isArray(meta),
-  "Meta Length": meta.length,
-  "Total Buckets": keys.length.toLocaleString()
-}]);
+const stats = {
+  bucketsTotal: keys.length,
+  nonArrayBuckets: 0,
+  emptyBuckets: 0,
+  singleBuckets: 0,
+  multiBuckets: 0,
+  maxBucketLen: 0,
+  totalEntries: 0,
+  validEntries: 0,
+  badShape: 0,
+  badTimes: 0,
+  maxTimesLen: 0,
+};
 
-if (!keys.length) {
-  console.error("❌ EMPTY INDEX: No keys found.");
-  process.exit(0);
-}
-
-const sampleKey = keys[0];
-const bucket = idx[sampleKey];
-
-console.log("\n🔹 SAMPLE BUCKET INSPECTION");
-console.log(`Key: "${sampleKey}"`);
-console.log(`Type: ${Array.isArray(bucket) ? "Array" : typeof bucket}`);
-console.log(`Length: ${bucket?.length ?? "N/A"}`);
-
-if (Array.isArray(bucket)) {
-  const first3 = bucket.slice(0, 3).map((it) => {
-    if (!Array.isArray(it) || it.length !== 2) return { Status: "BAD SHAPE", Raw: JSON.stringify(it) };
-    const [fid, times] = it;
-    return {
-      "File ID": fid,
-      "File Name": (typeof fid === "number" && meta[fid]) ? meta[fid] : "N/A",
-      "Times Type": Array.isArray(times) ? `Array(${times.length})` : typeof times,
-      "First 5 Times": Array.isArray(times) ? JSON.stringify(times.slice(0, 5)) : times
-    };
-  });
-  console.table(first3);
-} else {
-  console.log("Value:", bucket);
-}
-
-let bucketStats = { nonArray: 0, empty: 0, len1: 0, len2p: 0, maxLen: 0 };
-let entryStats = { totalEntries: 0, validFidTimes: 0, badShape: 0, badTimes: 0, maxTimesLen: 0 };
-let fileHits = new Map();
+const fileHits = new Map();
+const pairCounts = new Map();
 
 for (const k of keys) {
-  const b = idx[k];
+  const bucket = idx[k];
+  if (!Array.isArray(bucket)) { stats.nonArrayBuckets++; continue; }
 
-  if (!Array.isArray(b)) {
-    bucketStats.nonArray++;
-    continue;
-  }
+  const L = bucket.length;
+  stats.maxBucketLen = Math.max(stats.maxBucketLen, L);
+  if (L === 0) stats.emptyBuckets++;
+  else if (L === 1) stats.singleBuckets++;
+  else stats.multiBuckets++;
 
-  const L = b.length;
-  if (L === 0) bucketStats.empty++;
-  else if (L === 1) bucketStats.len1++;
-  else bucketStats.len2p++;
-  if (L > bucketStats.maxLen) bucketStats.maxLen = L;
+  const uniq = new Set();
 
-  for (const it of b) {
-    entryStats.totalEntries++;
-    if (!Array.isArray(it) || it.length !== 2) {
-      entryStats.badShape++;
-      continue;
-    }
+  for (const it of bucket) {
+    stats.totalEntries++;
+    if (!Array.isArray(it) || it.length !== 2) { stats.badShape++; continue; }
+
     const [fid, times] = it;
-    if (!Array.isArray(times)) {
-      entryStats.badTimes++;
-      continue;
+    if (!Array.isArray(times)) { stats.badTimes++; continue; }
+
+    stats.validEntries++;
+    stats.maxTimesLen = Math.max(stats.maxTimesLen, times.length);
+
+    if (fid != null) {
+      uniq.add(fid);
+      fileHits.set(fid, (fileHits.get(fid) || 0) + 1);
     }
-    entryStats.validFidTimes++;
-    if (times.length > entryStats.maxTimesLen) entryStats.maxTimesLen = times.length;
-    fileHits.set(fid, (fileHits.get(fid) || 0) + 1);
+  }
+
+  const arr = [...uniq];
+  for (let i = 0; i < arr.length; i++) for (let j = i + 1; j < arr.length; j++) {
+    const a = arr[i], b = arr[j];
+    const key = a < b ? `${a}|${b}` : `${b}|${a}`;
+    pairCounts.set(key, (pairCounts.get(key) || 0) + 1);
   }
 }
 
-console.log("\n📊 STATISTICS SUMMARY");
-console.table({
-  "Buckets: Non-Array": bucketStats.nonArray,
-  "Buckets: Empty": bucketStats.empty,
-  "Buckets: Single Entry": bucketStats.len1.toLocaleString(),
-  "Buckets: Multi Entry": bucketStats.len2p.toLocaleString(),
-  "Max Bucket Len": bucketStats.maxLen.toLocaleString(),
-  "Total Entries": entryStats.totalEntries.toLocaleString(),
-  "Valid Entries": entryStats.validFidTimes.toLocaleString(),
-  "Max Times Len": entryStats.maxTimesLen.toLocaleString()
-});
+const pairs = [...pairCounts].map(([k, count]) => {
+  const [sa, sb] = k.split("|");
+  const a = isNaN(+sa) ? sa : +sa;
+  const b = isNaN(+sb) ? sb : +sb;
+  return { a, b, count, nameA: meta[a] || null, nameB: meta[b] || null };
+}).sort((x, y) => y.count - x.count);
 
-const topFiles = Array.from(fileHits.entries())
-  .sort((a, b) => b[1] - a[1])
-  .slice(0, 15)
-  .map(([fid, c]) => ({
-    "File ID": fid,
-    "Occurrences": c.toLocaleString(),
-    "File Name": (typeof fid === "number" && meta[fid]) ? meta[fid] : "N/A"
-  }));
+const topFiles = [...fileHits].sort((a, b) => b[1] - a[1]).slice(0, 15).map(([id, occurrences]) => ({
+  id, occurrences, name: meta[id] || null
+}));
 
-console.log("\n🏆 TOP 15 FILES (by occurrence)");
-console.table(topFiles);
+fs.writeFileSync("pairs-full.json", JSON.stringify({
+  summary: stats,
+  totalPairs: pairs.length,
+  topFiles,
+  pairs
+}, null, 2));
 
-console.log("\n🔗 PAIR MATCH ANALYSIS");
-const SEP = "|";
-const pair = new Map();
+fs.writeFileSync("pairs-full.csv",
+  ["a,b,count,nameA,nameB"].concat(
+    pairs.map(p => [
+      p.a,
+      p.b,
+      p.count,
+      p.nameA ? `"${path.basename(String(p.nameA)).replace(/"/g, '""')}"` : "",
+      p.nameB ? `"${path.basename(String(p.nameB)).replace(/"/g, '""')}"` : ""
+    ].join(","))
+  ).join("\n")
+);
 
-for (const k of keys) {
-  const b = idx[k];
-  if (!Array.isArray(b) || b.length < 2) continue;
+const TOP = +process.env.TOP || 50;
+console.log(JSON.stringify({ summary: stats, totalPairs: pairs.length, topShown: Math.min(TOP, pairs.length) }, null, 2));
+pairs.slice(0, TOP).forEach((p, i) =>
+  console.log(`#${i + 1}`, p.count, p.a, p.b, p.nameA ? `(${p.nameA})` : "", p.nameB ? `(${p.nameB})` : "")
+);
 
-  for (let i = 0; i < b.length; i++) {
-    const itA = b[i];
-    if (!Array.isArray(itA) || itA.length !== 2) continue;
-    const a = itA[0];
+fs.mkdirSync("dupe", { recursive: true });
+const moved = new Set();
+const MIN = +process.env.MIN_PAIR_COUNT || 2;
 
-    for (let j = i + 1; j < b.length; j++) {
-      const itB = b[j];
-      if (!Array.isArray(itB) || itB.length !== 2) continue;
-      const c = itB[0];
+for (const p of pairs) {
+  if (p.count < MIN || !p.nameA || !p.nameB) continue;
 
-      if (a === c) continue;
+  const srcA = path.resolve(String(p.nameA));
+  const srcB = path.resolve(String(p.nameB));
+  const hasA = fs.existsSync(srcA);
+  const hasB = fs.existsSync(srcB);
+  if (!hasA && !hasB) continue;
 
-      const pk = a < c ? `${a}${SEP}${c}` : `${c}${SEP}${a}`;
-      pair.set(pk, (pair.get(pk) || 0) + 1);
+  const tag = `${String(p.a).replace(/[^\w-]/g, "_")}_${String(p.b).replace(/[^\w-]/g, "_")}_x${p.count}`;
+  const dst = path.join("dupe", tag);
+  fs.mkdirSync(dst, { recursive: true });
+
+  const mv = (src, name, label) => {
+    try {
+      if (src && !moved.has(src) && fs.existsSync(src)) {
+        fs.renameSync(src, path.join(dst, path.basename(String(name))));
+        moved.add(src);
+      }
+    } catch (e) {
+      console.warn(label, "move failed:", e.message);
     }
-  }
+  };
+
+  mv(hasA ? srcA : null, p.nameA, "A");
+  mv(hasB ? srcB : null, p.nameB, "B");
 }
-
-console.log(`Total Unique Pairs Found: ${pair.size.toLocaleString()}`);
-
-const allPairs = Array.from(pair.entries())
-  .sort((a, b) => b[1] - a[1])
-  .map(([pk, count]) => {
-    const [a, b] = pk.split(SEP);
-    const ai = +a, bi = +b;
-
-    return {
-      Count: count,
-      "ID Pair": `${a} ↔ ${b}`,
-      "File A": (Number.isFinite(ai) && meta[ai]) ? meta[ai] : `(ID: ${a})`,
-      "File B": (Number.isFinite(bi) && meta[bi]) ? meta[bi] : `(ID: ${b})`
-    };
-  });
-
-console.log("\n📌 ALL CO-OCCURRING PAIRS (sorted desc):");
-console.table(allPairs);
-
-console.log("\n📦 MOVING PAIR MATCH TRACKS TO ./dupe");
-const DUPE_DIR = path.resolve("dupe");
-fs.mkdirSync(DUPE_DIR, { recursive: true });
-
-for (const row of allPairs) {
-  const [a, b] = String(row["ID Pair"]).split(" ↔ ");
-  const ai = +a, bi = +b;
-  if (!Number.isFinite(ai) || !Number.isFinite(bi)) continue;
-  if (!meta[ai] || !meta[bi]) continue;
-
-  const srcA = path.resolve(meta[ai]);
-  const srcB = path.resolve(meta[bi]);
-
-  const tag = `${ai}_${bi}_x${row.Count}`;
-  const pairDir = path.join(DUPE_DIR, tag);
-  fs.mkdirSync(pairDir, { recursive: true });
-
-  const dstA = path.join(pairDir, path.basename(meta[ai]));
-  const dstB = path.join(pairDir, path.basename(meta[bi]));
-
-  try { if (fs.existsSync(srcA)) fs.renameSync(srcA, dstA); } catch (e) { console.warn("Move fail A:", srcA, e.message); }
-  try { if (fs.existsSync(srcB)) fs.renameSync(srcB, dstB); } catch (e) { console.warn("Move fail B:", srcB, e.message); }
-}
-
-console.log("\n=== DONE ===");
