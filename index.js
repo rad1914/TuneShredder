@@ -17,19 +17,22 @@ const C = {
   zone: 30,
   min: 0.02,
   anchorEvery: 2,
+  seconds: 85,
+  maxInsert: 512,
+  batch: 200_000,
 };
 
 const WIN = (() => {
-  const w = new Float32Array(C.win), n = w.length - 1;
+  const w = new Float32Array(C.win);
+  const n = w.length - 1;
   for (let i = 0; i < w.length; i++) w[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / n));
   return w;
 })();
 
 const H = (f1, f2, dt) => (((f1 & 2047) << 17) | ((f2 & 2047) << 6) | (dt & 63)) | 0;
 
-const dbInit = () => {
+function dbInit() {
   const db = new DB(DBFILE);
-
   db.pragma("journal_mode=WAL");
   db.exec(`
     PRAGMA synchronous=OFF;
@@ -50,30 +53,32 @@ const dbInit = () => {
       PRIMARY KEY(h, id, t)
     ) WITHOUT ROWID;
   `);
-
   return db;
-};
+}
 
-const mkPeaks = () => {
+function mkPeaks() {
   const fft = new FFT(C.win);
   const inp = new Float32Array(C.win);
   const out = fft.createComplexArray();
   const mags = new Float32Array(C.win / 2);
+
   const bins = new Int32Array(C.top);
   const mag = new Float32Array(C.top);
-  const ret = { bins, n: 0 };
 
   return (frame) => {
     for (let i = 0; i < C.win; i++) inp[i] = frame[i] * WIN[i];
+
     fft.realTransform(out, inp);
     fft.completeSpectrum(out);
 
     for (let k = 0; k < mags.length; k++) {
-      const re = out[2 * k], im = out[2 * k + 1];
+      const re = out[2 * k],
+        im = out[2 * k + 1];
       mags[k] = re * re + im * im;
     }
 
-    bins.fill(0); mag.fill(0);
+    bins.fill(0);
+    mag.fill(0);
 
     for (let k = 2; k < mags.length - 2; k++) {
       const a = mags[k];
@@ -81,123 +86,126 @@ const mkPeaks = () => {
       if (!(a > mags[k - 1] && a > mags[k + 1] && a > mags[k - 2] && a > mags[k + 2])) continue;
 
       let ins = -1;
-      for (let i = 0; i < C.top; i++) if (a > mag[i]) { ins = i; break; }
+      for (let i = 0; i < C.top; i++) {
+        if (a > mag[i]) {
+          ins = i;
+          break;
+        }
+      }
       if (ins < 0) continue;
 
-      for (let i = C.top - 1; i > ins; i--) (mag[i] = mag[i - 1]), (bins[i] = bins[i - 1]);
-      mag[ins] = a; bins[ins] = k;
+      for (let i = C.top - 1; i > ins; i--) {
+        mag[i] = mag[i - 1];
+        bins[i] = bins[i - 1];
+      }
+      mag[ins] = a;
+      bins[ins] = k;
     }
 
     let n = 0;
     while (n < C.top && mag[n] > 0) n++;
-    ret.n = n;
-    return ret;
+    return { bins, n };
   };
-};
+}
 
-const eachFrame = (file, cb) =>
-  new Promise((res, rej) => {
+function eachFrame(file, cb) {
+  return new Promise((res, rej) => {
     const p = spawn(
       "ffmpeg",
       [
-        "-v", "error",
+        "-v",
+        "error",
         "-nostdin",
-        "-threads", "0",
-        "-i", file,
-        "-t", 85,
-        "-ac", "" + C.ch,
-        "-ar", "" + C.sr,
-        "-vn", "-sn", "-dn",
-        "-f", "f32le",
+        "-threads",
+        "0",
+        "-i",
+        file,
+        "-t",
+        "" + C.seconds,
+        "-ac",
+        "" + C.ch,
+        "-ar",
+        "" + C.sr,
+        "-vn",
+        "-sn",
+        "-dn",
+        "-f",
+        "f32le",
         "pipe:1",
       ],
       { stdio: ["ignore", "pipe", "inherit"] }
     );
 
-    const bps = 4, win = C.win, hop = C.hop;
-    const ringBuf = Buffer.allocUnsafe(2 * win * bps);
-    const ring = new Float32Array(ringBuf.buffer, ringBuf.byteOffset, 2 * win);
+    const bps = 4;
+    const hopBytes = C.hop * bps;
 
-    const hopBytes = hop * bps;
+    const ringBuf = Buffer.allocUnsafe(2 * C.win * bps);
+    const ring = new Float32Array(ringBuf.buffer, ringBuf.byteOffset, 2 * C.win);
+
     const hopBuf = Buffer.allocUnsafe(hopBytes);
-    const hopView = new Float32Array(hopBuf.buffer, hopBuf.byteOffset, hop);
-    const frame = new Float32Array(win);
+    const hopView = new Float32Array(hopBuf.buffer, hopBuf.byteOffset, C.hop);
 
-    let hopFill = 0, filled = 0, head = 0, t = 0;
+    const frame = new Float32Array(C.win);
 
-    const emit = () => { frame.set(ring.subarray(head, head + win)); cb(frame, t++); };
+    let hopFill = 0,
+      filled = 0,
+      head = 0,
+      t = 0;
+
+    const emit = () => {
+      frame.set(ring.subarray(head, head + C.win));
+      cb(frame, t++);
+    };
 
     p.stdout.on("data", (chunk) => {
       for (let off = 0; off < chunk.length; ) {
         const take = Math.min(hopBytes - hopFill, chunk.length - off);
         chunk.copy(hopBuf, hopFill, off, off + take);
-        hopFill += take; off += take;
+        hopFill += take;
+        off += take;
+
         if (hopFill !== hopBytes) continue;
         hopFill = 0;
 
         ring.set(hopView, head);
-        ring.set(hopView, head + win);
-        head = (head + hop) % win;
-        filled = Math.min(win, filled + hop);
-        if (filled === win) emit();
+        ring.set(hopView, head + C.win);
+        head = (head + C.hop) % C.win;
+
+        filled = Math.min(C.win, filled + C.hop);
+        if (filled === C.win) emit();
       }
     });
 
     p.on("close", (c) => (c ? rej(new Error("ffmpeg decode failed")) : res(t)));
   });
+}
 
 async function build(dir) {
   const db = dbInit();
 
-const insTrackGetId = db.prepare(`
-  INSERT INTO tracks(name)
-  VALUES (?)
-  ON CONFLICT(name) DO UPDATE SET name=excluded.name
-  RETURNING id
-`);
+  const insTrack = db.prepare("INSERT OR IGNORE INTO tracks(name) VALUES(?)");
+  const getTrack = db.prepare("SELECT id FROM tracks WHERE name=?");
 
-  const MAX_MULTI = 512;
-  const insFpMany = db.prepare(
-    "INSERT OR IGNORE INTO fp(h,id,t) VALUES " +
-      Array.from({ length: MAX_MULTI }, () => "(?,?,?)").join(",")
-  );
+  const makeInsert = (take) =>
+    db.prepare(
+      "INSERT OR IGNORE INTO fp(h,id,t) VALUES " +
+        Array.from({ length: take }, () => "(?,?,?)").join(",")
+    );
 
-  const insFpCache = new Map();
-  const insFpTake = (take) => {
-    let stmt = insFpCache.get(take);
-    if (!stmt) {
-      stmt = db.prepare(
-        "INSERT OR IGNORE INTO fp(h,id,t) VALUES " +
-          Array.from({ length: take }, () => "(?,?,?)").join(",")
-      );
-      insFpCache.set(take, stmt);
-    }
-    return stmt;
-  };
+  const insertMany = makeInsert(C.maxInsert);
 
-  const B = 200_000;
-  const Hh = new Int32Array(B);
-  const Tt = new Int32Array(B);
-  let bn = 0;
-
-  const addBatch = db.transaction((id, H, T, n) => {
-    let i = 0;
-    while (i < n) {
-      const take = Math.min(MAX_MULTI, n - i);
+  const addBatch = db.transaction((id, Hh, Tt, n) => {
+    for (let i = 0; i < n; ) {
+      const take = Math.min(C.maxInsert, n - i);
       const args = new Array(take * 3);
 
       for (let k = 0; k < take; k++) {
-        args[3 * k] = H[i + k];
+        args[3 * k] = Hh[i + k];
         args[3 * k + 1] = id;
-        args[3 * k + 2] = T[i + k];
+        args[3 * k + 2] = Tt[i + k];
       }
 
-      if (take === MAX_MULTI) {
-        insFpMany.run(...args);
-      } else {
-        insFpTake(take).run(...args);
-      }
-
+      (take === C.maxInsert ? insertMany : makeInsert(take)).run(...args);
       i += take;
     }
   });
@@ -208,19 +216,32 @@ const insTrackGetId = db.prepare(`
 
   const peaks = mkPeaks();
 
+  const Hh = new Int32Array(C.batch);
+  const Tt = new Int32Array(C.batch);
+  let bn = 0;
+
   for (const file of files) {
     const name = path.basename(file);
-    const row = db.prepare("SELECT 1 FROM tracks WHERE name=?").get(name);
-    if (row) {
+    if (getTrack.get(name)) {
       console.log("skip:", name);
       continue;
     }
 
     console.log("indexing:", name);
-    const id = insTrackGetId.get(name).id;
+    insTrack.run(name);
+    const id = getTrack.get(name).id;
 
-    const flush = () => { if (bn) addBatch(id, Hh, Tt, bn), (bn = 0); };
-    const add = (h, t) => { Hh[bn] = h; Tt[bn] = t; if (++bn === B) flush(); };
+    const flush = () => {
+      if (!bn) return;
+      addBatch(id, Hh, Tt, bn);
+      bn = 0;
+    };
+
+    const add = (h, t) => {
+      Hh[bn] = h;
+      Tt[bn] = t;
+      if (++bn === C.batch) flush();
+    };
 
     const ringBins = Array.from({ length: C.zone + 1 }, () => new Int32Array(C.top));
     const ringN = new Int8Array(C.zone + 1);
@@ -231,7 +252,7 @@ const insTrackGetId = db.prepare(`
       ringBins[rp].set(p.bins);
       ringN[rp] = p.n;
 
-      if (p.n && (t % C.anchorEvery === 0)) {
+      if (p.n && t % C.anchorEvery === 0) {
         const f2n = Math.min(C.fan, p.n);
 
         for (let back = 1; back <= C.zone; back++) {
