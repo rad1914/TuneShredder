@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import FFT from "fft.js";
 import DB from "better-sqlite3";
+import { dbInit } from "./utils.js";
 
 const DBFILE = "./db/fp.sqlite";
 const EXT = /\.(mp3|wav|flac|ogg|opus|m4a)$/i;
@@ -27,33 +28,6 @@ const WIN = (() => {
 })();
 
 const H = (f1, f2, dt) => (((f1 & 2047) << 17) | ((f2 & 2047) << 6) | (dt & 63)) | 0;
-
-const dbInit = () => {
-    const db = new DB(DBFILE);
-
-    db.pragma("journal_mode=WAL");
-    db.exec(`
-    PRAGMA synchronous=OFF;
-    PRAGMA temp_store=MEMORY;
-    PRAGMA cache_size=-200000;
-    PRAGMA locking_mode=EXCLUSIVE;
-    PRAGMA mmap_size=268435456;
-
-    CREATE TABLE IF NOT EXISTS tracks(
-      id INTEGER PRIMARY KEY,
-      name TEXT NOT NULL UNIQUE
-    );
-
-    CREATE TABLE IF NOT EXISTS fp(
-      h  INTEGER NOT NULL,
-      id INTEGER NOT NULL,
-      t  INTEGER NOT NULL,
-      PRIMARY KEY(h, id, t)
-    ) WITHOUT ROWID;
-  `);
-
-    return db;
-};
 
 const mkPeaks = () => {
     const fft = new FFT(C.win);
