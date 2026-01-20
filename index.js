@@ -5,7 +5,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import FFT from "fft.js";
 import {
-    dbInit
+    dbInit, db
 } from "./utils.js";
 
 const EXT = /\.(mp3|wav|flac|ogg|opus|m4a)$/i;

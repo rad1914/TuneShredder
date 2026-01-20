@@ -1,5 +1,5 @@
 export const dbInit = () => {
-    const db = new DB(DBFILE);
+    export const db = new DB(DBFILE);
 
     db.pragma("journal_mode=WAL");
     db.exec(`
