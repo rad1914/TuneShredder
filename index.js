@@ -7,7 +7,7 @@ import FFT from "fft.js";
 
 const INDEX_JSON = "./data/index.json";
 const TRACKS_DIR = "./t";
-const MAX_BYTES = 2 * 1024 * 1024;
+const MAX_BYTES = 5 * 1024 * 1024;
 
 const CFG = {
     sr: 22050,
