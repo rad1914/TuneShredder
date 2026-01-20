@@ -1,8 +1,8 @@
-export const dbInit = () => {
-    export const db = new DB(DBFILE);
+export const db = new DB(DBFILE);
 
-    db.pragma("journal_mode=WAL");
-    db.exec(`
+export const dbInit = () => {
+  db.pragma("journal_mode = WAL");
+  db.exec(`
     PRAGMA synchronous=OFF;
     PRAGMA temp_store=MEMORY;
     PRAGMA cache_size=-200000;
@@ -22,5 +22,5 @@ export const dbInit = () => {
     ) WITHOUT ROWID;
   `);
 
-    return db;
+  return db;
 };
