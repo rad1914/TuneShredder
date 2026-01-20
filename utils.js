@@ -1,6 +1,12 @@
-export const db = new DB(DBFILE);
+// @path: utils.js
+import Database from "better-sqlite3";
+
+const DBFILE = "./fingerprints.sqlite";
+export let db;
 
 export const dbInit = () => {
+  if (db) return db;
+  db = new Database(DBFILE);
   db.pragma("journal_mode = WAL");
   db.exec(`
     PRAGMA synchronous=OFF;
@@ -21,6 +27,5 @@ export const dbInit = () => {
       PRIMARY KEY(h, id, t)
     ) WITHOUT ROWID;
   `);
-
   return db;
 };

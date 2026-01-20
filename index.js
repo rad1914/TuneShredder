@@ -1,3 +1,4 @@
+// @path: index.js
 import {
     spawn
 } from "node:child_process";
