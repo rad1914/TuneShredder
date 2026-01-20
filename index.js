@@ -102,7 +102,7 @@ const eachFrame = (file, cb) =>
       [
         "-v", "error",
         "-nostdin",
-        "-threads", "1",
+        "-threads", "0",
         "-i", file,
         "-t", 85,
         "-ac", "" + C.ch,
@@ -120,6 +120,7 @@ const eachFrame = (file, cb) =>
 
     const hopBytes = hop * bps;
     const hopBuf = Buffer.allocUnsafe(hopBytes);
+    const hopView = new Float32Array(hopBuf.buffer, hopBuf.byteOffset, hop);
     const frame = new Float32Array(win);
 
     let hopFill = 0, filled = 0, head = 0, t = 0;
@@ -134,9 +135,8 @@ const eachFrame = (file, cb) =>
         if (hopFill !== hopBytes) continue;
         hopFill = 0;
 
-        const v = new Float32Array(hopBuf.buffer, hopBuf.byteOffset, hop);
-        ring.set(v, head);
-        ring.set(v, head + win);
+        ring.set(hopView, head);
+        ring.set(hopView, head + win);
         head = (head + hop) % win;
         filled = Math.min(win, filled + hop);
         if (filled === win) emit();
@@ -149,14 +149,31 @@ const eachFrame = (file, cb) =>
 async function build(dir) {
   const db = dbInit();
 
-  const insTrack = db.prepare("INSERT OR IGNORE INTO tracks(name) VALUES(?)");
-  const getTrack = db.prepare("SELECT id FROM tracks WHERE name=?");
+const insTrackGetId = db.prepare(`
+  INSERT INTO tracks(name)
+  VALUES (?)
+  ON CONFLICT(name) DO UPDATE SET name=excluded.name
+  RETURNING id
+`);
 
   const MAX_MULTI = 512;
   const insFpMany = db.prepare(
     "INSERT OR IGNORE INTO fp(h,id,t) VALUES " +
       Array.from({ length: MAX_MULTI }, () => "(?,?,?)").join(",")
   );
+
+  const insFpCache = new Map();
+  const insFpTake = (take) => {
+    let stmt = insFpCache.get(take);
+    if (!stmt) {
+      stmt = db.prepare(
+        "INSERT OR IGNORE INTO fp(h,id,t) VALUES " +
+          Array.from({ length: take }, () => "(?,?,?)").join(",")
+      );
+      insFpCache.set(take, stmt);
+    }
+    return stmt;
+  };
 
   const B = 200_000;
   const Hh = new Int32Array(B);
@@ -178,10 +195,7 @@ async function build(dir) {
       if (take === MAX_MULTI) {
         insFpMany.run(...args);
       } else {
-        db.prepare(
-          "INSERT OR IGNORE INTO fp(h,id,t) VALUES " +
-            Array.from({ length: take }, () => "(?,?,?)").join(",")
-        ).run(...args);
+        insFpTake(take).run(...args);
       }
 
       i += take;
@@ -196,15 +210,14 @@ async function build(dir) {
 
   for (const file of files) {
     const name = path.basename(file);
-    const row = getTrack.get(name);
+    const row = db.prepare("SELECT 1 FROM tracks WHERE name=?").get(name);
     if (row) {
       console.log("skip:", name);
       continue;
     }
 
     console.log("indexing:", name);
-    insTrack.run(name);
-    const id = getTrack.get(name).id;
+    const id = insTrackGetId.get(name).id;
 
     const flush = () => { if (bn) addBatch(id, Hh, Tt, bn), (bn = 0); };
     const add = (h, t) => { Hh[bn] = h; Tt[bn] = t; if (++bn === B) flush(); };
