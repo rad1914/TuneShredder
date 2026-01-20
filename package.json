@@ -1,4 +1,5 @@
 {
+  "type": "module",
   "dependencies": {
     "fast-glob": "^3.3.3",
     "fft.js": "^4.0.4"

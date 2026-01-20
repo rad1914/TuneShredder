@@ -1,148 +1,292 @@
-import { spawn } from "node:child_process";
+// @path: index.js
+import {
+    spawn
+} from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import FFT from "fft.js";
-import Database from "better-sqlite3";
+import DB from "better-sqlite3";
 
-const DBFILE = "./fingerprints.sqlite";
+const DBFILE = "./db/fp.sqlite";
 const EXT = /\.(mp3|wav|flac|ogg|opus|m4a)$/i;
 
-const CFG = {
-  sr: 22050,
-  ch: 1,
-  win: 4096,
-  hop: 512,
-  top: 18,
-  fan: 8,
-  zone: 45,
-  min: 0.015,
+const C = {
+    sr: 22050,
+    ch: 1,
+    win: 4096,
+    hop: 512,
+
+    top: 16,
+    fan: 6,
+    zone: 35,
+    min: 0.01,
+    anchorEvery: 2,
+    maxSec: 80,
 };
 
 const WIN = (() => {
-  const w = new Float32Array(CFG.win);
-  for (let i = 0; i < w.length; i++) w[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (w.length - 1)));
-  return w;
+    const w = new Float32Array(C.win),
+        n = w.length - 1;
+    for (let i = 0; i < w.length; i++) w[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / n));
+    return w;
 })();
 
-const decode = (file) =>
-  new Promise((res, rej) => {
-    const p = spawn(
-      "ffmpeg",
-      ["-v", "error", "-i", file, "-ac", "" + CFG.ch, "-ar", "" + CFG.sr, "-f", "f32le", "pipe:1"],
-      { stdio: ["ignore", "pipe", "inherit"] }
-    );
-    const chunks = [];
-    p.stdout.on("data", (d) => chunks.push(d));
-    p.on("close", (c) => {
-      if (c) return rej(new Error("ffmpeg decode failed"));
-      const buf = Buffer.concat(chunks);
-      res(new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength >> 2));
-    });
-  });
+const H = (f1, f2, dt) => (((f1 & 2047) << 17) | ((f2 & 2047) << 6) | (dt & 63)) | 0;
 
-const peaks = (() => {
-  const fft = new FFT(CFG.win);
-  const inp = new Float32Array(CFG.win);
-  const out = fft.createComplexArray();
-  const mags = new Float32Array(CFG.win / 2);
+const dbInit = () => {
+    const db = new DB(DBFILE);
 
-  return (s) => {
-    const frames = [];
-    for (let i = 0; i + CFG.win <= s.length; i += CFG.hop) {
-      for (let j = 0; j < CFG.win; j++) inp[j] = s[i + j] * WIN[j];
-      fft.realTransform(out, inp);
-      fft.completeSpectrum(out);
-
-      for (let k = 0; k < mags.length; k++) {
-        const re = out[2 * k], im = out[2 * k + 1];
-        mags[k] = Math.hypot(re, im);
-      }
-
-      const p = [];
-      for (let k = 2; k < mags.length - 2; k++) {
-        const a = mags[k];
-        if (a < CFG.min) continue;
-        if (a > mags[k - 1] && a > mags[k + 1] && a > mags[k - 2] && a > mags[k + 2]) p.push([k, a]);
-      }
-      p.sort((a, b) => b[1] - a[1]);
-      frames.push(p.slice(0, CFG.top).map((x) => x[0]));
-    }
-    return frames;
-  };
-})();
-
-const h3 = (f1, f2, dt) => (((f1 & 2047) << 17) | ((f2 & 2047) << 6) | (dt & 63)) | 0;
-
-const fingerprint = (pk) => {
-  const fp = [];
-  for (let t = 0; t < pk.length; t++) {
-    const a = pk[t];
-    if (!a?.length) continue;
-    for (let i = 0; i < a.length; i++) {
-      const f1 = a[i];
-      for (let dt = 1; dt <= CFG.zone; dt++) {
-        const b = pk[t + dt];
-        if (!b?.length) continue;
-        for (let j = 0; j < Math.min(CFG.fan, b.length); j++) fp.push([h3(f1, b[j], dt), t]);
-      }
-    }
-  }
-  return fp;
-};
-
-const initDb = (file) => {
-  const db = new Database(file);
-  db.pragma("journal_mode = WAL");
-  db.exec(`
-    PRAGMA synchronous=NORMAL;
+    db.pragma("journal_mode=WAL");
+    db.exec(`
+    PRAGMA synchronous=OFF;
     PRAGMA temp_store=MEMORY;
+    PRAGMA cache_size=-200000;
+    PRAGMA locking_mode=EXCLUSIVE;
+    PRAGMA mmap_size=268435456;
 
-    CREATE TABLE IF NOT EXISTS tracks (
-      id   INTEGER PRIMARY KEY,
-      name TEXT NOT NULL
+    CREATE TABLE IF NOT EXISTS tracks(
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE
     );
 
-    CREATE TABLE IF NOT EXISTS fp (
+    CREATE TABLE IF NOT EXISTS fp(
       h  INTEGER NOT NULL,
+      id INTEGER NOT NULL,
       t  INTEGER NOT NULL,
-      id INTEGER NOT NULL REFERENCES tracks(id)
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_fp_h  ON fp(h);
-    CREATE INDEX IF NOT EXISTS idx_fp_id ON fp(id);
+      PRIMARY KEY(h, id, t)
+    ) WITHOUT ROWID;
   `);
-  return db;
+
+    return db;
 };
+
+const mkPeaks = () => {
+    const fft = new FFT(C.win);
+    const inp = new Float32Array(C.win);
+    const out = fft.createComplexArray();
+    const mags = new Float32Array(C.win / 2);
+    const bins = new Int32Array(C.top);
+    const mag = new Float32Array(C.top);
+    const ret = {
+        bins,
+        n: 0
+    };
+
+    return (frame) => {
+        for (let i = 0; i < C.win; i++) inp[i] = frame[i] * WIN[i];
+        fft.realTransform(out, inp);
+        fft.completeSpectrum(out);
+
+        for (let k = 0; k < mags.length; k++) {
+            const re = out[2 * k],
+                im = out[2 * k + 1];
+            mags[k] = re * re + im * im;
+        }
+
+        bins.fill(0);
+        mag.fill(0);
+
+        for (let k = 2; k < mags.length - 2; k++) {
+            const a = mags[k];
+            if (a < C.min) continue;
+            if (!(a > mags[k - 1] && a > mags[k + 1] && a > mags[k - 2] && a > mags[k + 2])) continue;
+
+            let ins = -1;
+            for (let i = 0; i < C.top; i++)
+                if (a > mag[i]) {
+                    ins = i;
+                    break;
+                }
+            if (ins < 0) continue;
+
+            for (let i = C.top - 1; i > ins; i--)(mag[i] = mag[i - 1]), (bins[i] = bins[i - 1]);
+            mag[ins] = a;
+            bins[ins] = k;
+        }
+
+        let n = 0;
+        while (n < C.top && mag[n] > 0) n++;
+        ret.n = n;
+        return ret;
+    };
+};
+
+const eachFrame = (file, cb) =>
+    new Promise((res, rej) => {
+        const p = spawn(
+            "ffmpeg",
+            [
+                "-v", "error",
+                "-nostdin",
+                "-threads", "1",
+                "-i", file,
+                "-t", "" + C.maxSec,
+                "-ac", "" + C.ch,
+                "-ar", "" + C.sr,
+                "-vn", "-sn", "-dn",
+                "-f", "f32le",
+                "pipe:1",
+            ], {
+                stdio: ["ignore", "pipe", "inherit"]
+            }
+        );
+
+        const bps = 4,
+            win = C.win,
+            hop = C.hop;
+        const ringBuf = Buffer.allocUnsafe(2 * win * bps);
+        const ring = new Float32Array(ringBuf.buffer, ringBuf.byteOffset, 2 * win);
+
+        const hopBytes = hop * bps;
+        const hopBuf = Buffer.allocUnsafe(hopBytes);
+        const frame = new Float32Array(win);
+
+        let hopFill = 0,
+            filled = 0,
+            head = 0,
+            t = 0;
+
+        const emit = () => {
+            frame.set(ring.subarray(head, head + win));
+            cb(frame, t++);
+        };
+
+        p.stdout.on("data", (chunk) => {
+            for (let off = 0; off < chunk.length;) {
+                const take = Math.min(hopBytes - hopFill, chunk.length - off);
+                chunk.copy(hopBuf, hopFill, off, off + take);
+                hopFill += take;
+                off += take;
+                if (hopFill !== hopBytes) continue;
+                hopFill = 0;
+
+                const v = new Float32Array(hopBuf.buffer, hopBuf.byteOffset, hop);
+                ring.set(v, head);
+                ring.set(v, head + win);
+                head = (head + hop) % win;
+                filled = Math.min(win, filled + hop);
+                if (filled === win) emit();
+            }
+        });
+
+        p.on("close", (c) => (c ? rej(new Error("ffmpeg decode failed")) : res(t)));
+    });
 
 async function build(dir) {
-  const db = initDb(DBFILE);
+    const db = dbInit();
 
-  db.exec("DELETE FROM fp; DELETE FROM tracks;");
+    const insTrack = db.prepare("INSERT OR IGNORE INTO tracks(name) VALUES(?)");
+    const getTrack = db.prepare("SELECT id FROM tracks WHERE name=?");
 
-  const insTrack = db.prepare("INSERT INTO tracks(name) VALUES(?)");
-  const insFp = db.prepare("INSERT INTO fp(h,t,id) VALUES(?,?,?)");
+    const MAX_MULTI = 512;
+    const insFpMany = db.prepare(
+        "INSERT OR IGNORE INTO fp(h,id,t) VALUES " +
+        Array.from({
+            length: MAX_MULTI
+        }, () => "(?,?,?)").join(",")
+    );
 
-  const addTrack = (name) => insTrack.run(name).lastInsertRowid;
-  const addFp = db.transaction((id, fp) => {
-    for (const [h, t] of fp) insFp.run(h, t, id);
-  });
+    const B = 200_000;
+    const Hh = new Int32Array(B);
+    const Tt = new Int32Array(B);
+    let bn = 0;
 
-  const files = (await fs.readdir(dir))
-    .filter((f) => EXT.test(f))
-    .map((f) => path.join(dir, f));
+    const addBatch = db.transaction((id, H, T, n) => {
+        let i = 0;
+        while (i < n) {
+            const take = Math.min(MAX_MULTI, n - i);
+            const args = new Array(take * 3);
 
-  for (const file of files) {
-    const name = path.basename(file);
-    console.log("indexing:", name);
-    const id = addTrack(name);
-    const samples = await decode(file);
-    addFp(id, fingerprint(peaks(samples)));
-  }
+            for (let k = 0; k < take; k++) {
+                args[3 * k] = H[i + k];
+                args[3 * k + 1] = id;
+                args[3 * k + 2] = T[i + k];
+            }
 
-  const tracks = db.prepare("SELECT COUNT(*) c FROM tracks").get().c;
-  const buckets = db.prepare("SELECT COUNT(DISTINCT h) c FROM fp").get().c;
-  db.close();
-  console.log("done:", tracks, "tracks,", buckets, "buckets");
+            if (take === MAX_MULTI) {
+                insFpMany.run(...args);
+            } else {
+                db.prepare(
+                    "INSERT OR IGNORE INTO fp(h,id,t) VALUES " +
+                    Array.from({
+                        length: take
+                    }, () => "(?,?,?)").join(",")
+                ).run(...args);
+            }
+
+            i += take;
+        }
+    });
+
+    const files = (await fs.readdir(dir))
+        .filter((f) => EXT.test(f))
+        .map((f) => path.join(dir, f));
+
+    const peaks = mkPeaks();
+
+    for (const file of files) {
+        const name = path.basename(file);
+        const row = getTrack.get(name);
+        if (row) {
+            console.log("skip:", name);
+            continue;
+        }
+
+        console.log("indexing:", name);
+        insTrack.run(name);
+        const id = getTrack.get(name).id;
+
+        const flush = () => {
+            if (bn) addBatch(id, Hh, Tt, bn), (bn = 0);
+        };
+        const add = (h, t) => {
+            Hh[bn] = h;
+            Tt[bn] = t;
+            if (++bn === B) flush();
+        };
+
+        const ringBins = Array.from({
+            length: C.zone + 1
+        }, () => new Int32Array(C.top));
+        const ringN = new Int8Array(C.zone + 1);
+        let rp = 0;
+
+        await eachFrame(file, (frame, t) => {
+            const p = peaks(frame);
+            ringBins[rp].set(p.bins);
+            ringN[rp] = p.n;
+
+            if (p.n && (t % C.anchorEvery === 0)) {
+                const f2n = Math.min(C.fan, p.n);
+
+                for (let back = 1; back <= C.zone; back++) {
+                    const pos = (rp - back + ringBins.length) % ringBins.length;
+                    const nPrev = ringN[pos];
+                    if (!nPrev) continue;
+
+                    const prev = ringBins[pos];
+                    const tt = t - back;
+
+                    for (let i = 0; i < nPrev; i++) {
+                        const f1 = prev[i];
+                        for (let j = 0; j < f2n; j++) add(H(f1, p.bins[j], back), tt);
+                    }
+                }
+            }
+
+            rp = (rp + 1) % ringBins.length;
+        });
+
+        flush();
+    }
+
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_fp_id ON fp(id);`);
+
+    const tracks = db.prepare("SELECT COUNT(*) c FROM tracks").get().c;
+    const buckets = db.prepare("SELECT COUNT(DISTINCT h) c FROM fp").get().c;
+    db.close();
+
+    console.log("done:", tracks, "tracks,", buckets, "buckets");
 }
 
 const [cmd, dir] = process.argv.slice(2);
