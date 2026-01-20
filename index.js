@@ -7,7 +7,7 @@ import FFT from "fft.js";
 
 const INDEX_JSON = "./data/index.json";
 const TRACKS_DIR = "./t";
-const MAX_BYTES = 5 * 1024 * 1024;
+const MAX_BYTES = 25 * 1024 * 1024;
 
 const CFG = {
     sr: 22050,
@@ -250,8 +250,8 @@ export async function buildIndex() {
     } catch {}
 
     if (meta.length) {
-        const done = new Set(meta);
-        files = files.filter((f) => !done.has(f));
+        const done = new Set(meta.map((m) => path.basename(String(m)).toLowerCase()));
+        files = files.filter((f) => !done.has(path.basename(f).toLowerCase()));
     }
 
     let fileId = meta.length;
