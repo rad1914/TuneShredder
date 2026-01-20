@@ -5,9 +5,9 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import FFT from "fft.js";
 
-const INDEX_JSON = "./data/index.json";
-const TRACKS_DIR = "./t";
-const MAX_BYTES = 25 * 1024 * 1024;
+const dat = "./data/index.json";
+const workdir = "./t/";
+const l = 25 * 1024 * 1024;
 
 const CFG = {
     sr: 22050,
@@ -19,30 +19,20 @@ const CFG = {
     pairs: 6,
     fq: 6,
     dtq: 2,
-    bucket: 250,
+    bucket: 250
 };
 
-const hann = new Float32Array(CFG.win);
-for (let i = 0; i < CFG.win; i++) hann[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (CFG.win - 1)));
+const hann = (() => {
+    const w = new Float32Array(CFG.win);
+    for (let i = 0; i < w.length; i++) w[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (w.length - 1)));
+    return w;
+})();
 
 const clamp = (x, lo, hi) => (x < lo ? lo : x > hi ? hi : x);
 
 const audioToF32 = (file) =>
     new Promise((res, rej) => {
-        const p = spawn("ffmpeg", [
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            file,
-            "-ac",
-            "" + CFG.ch,
-            "-ar",
-            "" + CFG.sr,
-            "-f",
-            "f32le",
-            "-",
-        ]);
+        const p = spawn("ffmpeg", ["-hide_banner", "-loglevel", "error", "-i", file, "-ac", "" + CFG.ch, "-ar", "" + CFG.sr, "-f", "f32le", "-"]);
         const chunks = [];
         let err = "";
         p.stdout.on("data", (c) => chunks.push(c));
@@ -68,11 +58,7 @@ function stftMags(x) {
         fft.realTransform(complex, inbuf);
 
         const mags = new Float32Array(half);
-        for (let b = 0; b < half; b++) {
-            const re = complex[b * 2] || 0;
-            const im = complex[b * 2 + 1] || 0;
-            mags[b] = Math.log1p(Math.hypot(re, im));
-        }
+        for (let b = 0; b < half; b++) mags[b] = Math.log1p(Math.hypot(complex[b * 2] || 0, complex[b * 2 + 1] || 0));
         out[t] = mags;
     }
     return out;
@@ -127,8 +113,7 @@ function hashes(mags) {
 
                     for (let i = 0; i < CFG.pairs; i++) {
                         if (s > bestS[i]) {
-                            for (let k = CFG.pairs - 1; k > i; k--)
-                                (bestS[k] = bestS[k - 1]), (bestF[k] = bestF[k - 1]), (bestDt[k] = bestDt[k - 1]);
+                            for (let k = CFG.pairs - 1; k > i; k--)(bestS[k] = bestS[k - 1]), (bestF[k] = bestF[k - 1]), (bestDt[k] = bestDt[k - 1]);
                             bestS[i] = s;
                             bestF[i] = f2q;
                             bestDt[i] = dt;
@@ -138,12 +123,12 @@ function hashes(mags) {
                 }
             }
 
-            for (let p = 0; p < CFG.pairs; p++)
-                if (bestF[p] !== -1)
-                    out.push({
-                        key: `${f1q}-${bestF[p]}-${Math.round(bestDt[p] / CFG.dtq)}`,
-                        t
-                    });
+            for (let p = 0; p < CFG.pairs; p++) {
+                if (bestF[p] !== -1) out.push({
+                    key: `${f1q}-${bestF[p]}-${Math.round(bestDt[p] / CFG.dtq)}`,
+                    t
+                });
+            }
         }
     }
     return out;
@@ -175,11 +160,12 @@ async function atomicWrite(file, data) {
 
 async function writeSplit(outFile, obj) {
     const full = JSON.stringify(obj);
-    if (Buffer.byteLength(full, "utf8") <= MAX_BYTES) return atomicWrite(outFile, full);
+    if (Buffer.byteLength(full, "utf8") <= l) return atomicWrite(outFile, full);
 
     const keys = Object.keys(obj.index || {});
     const meta = obj.meta || [];
     let part = 0;
+
     let cur = {
         index: {},
         meta
@@ -191,7 +177,7 @@ async function writeSplit(outFile, obj) {
         const sz = Buffer.byteLength(JSON.stringify({
             [k]: entry
         }), "utf8");
-        if (curSize + sz > MAX_BYTES && Object.keys(cur.index).length) {
+        if (curSize + sz > l && Object.keys(cur.index).length) {
             await atomicWrite(`${outFile}.${part++}.json`, JSON.stringify(cur));
             cur = {
                 index: {},
@@ -222,27 +208,28 @@ function normalizeBuckets(index) {
             const [fid, t] = it;
             (per[fid] ||= []).push(t);
         }
+
         const out = [];
         for (const fidStr of Object.keys(per)) {
-            const fid = +fidStr;
-            const times = per[fid].sort((a, b) => a - b);
-            if (times.length) out.push([fid, times]);
+            const times = per[fidStr].sort((a, b) => a - b);
+            if (times.length) out.push([+fidStr, times]);
         }
         index[k] = out;
     }
 }
 
 export async function buildIndex() {
-    let outFile = INDEX_JSON;
+    let outFile = dat;
     try {
         const st = await fs.stat(outFile);
         if (st.isDirectory()) outFile = path.join(outFile, "index.json");
     } catch {}
 
-    let files = (await fs.readdir(TRACKS_DIR)).filter((n) => /\.(wav|mp3|flac|m4a|ogg|opus)$/i.test(n));
+    let files = (await fs.readdir(workdir)).filter((n) => /\.(wav|mp3|flac|m4a|ogg|opus)$/i.test(n));
 
     let index = Object.create(null);
     let meta = [];
+
     try {
         const parsed = JSON.parse(await fs.readFile(outFile, "utf8"));
         if (parsed?.index) index = parsed.index;
@@ -259,13 +246,15 @@ export async function buildIndex() {
     for (let i = 0; i < files.length; i++) {
         const name = files[i];
         try {
-            mergeIndex(index, await fingerprint(path.join(TRACKS_DIR, name), fileId++));
+            mergeIndex(index, await fingerprint(path.join(workdir, name), fileId++));
             meta.push(name);
+
             normalizeBuckets(index);
             await writeSplit(outFile, {
                 index,
                 meta
             });
+
             console.log(`progress: ${i + 1}/${files.length} - ${name}`);
         } catch (e) {
             console.error("failed:", name, e?.message || e);
@@ -279,7 +268,4 @@ export async function buildIndex() {
     });
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-    const cmd = process.argv[2];
-    buildIndex().catch((e) => (console.error(e), process.exit(1)));
-}
+if (import.meta.url === `file://${process.argv[1]}`) buildIndex().catch((e) => (console.error(e), process.exit(1)));
