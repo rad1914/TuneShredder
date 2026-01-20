@@ -44,26 +44,6 @@ const audioToF32 = (file) =>
         });
     });
 
-function stftMags(x) {
-    const half = CFG.win >> 1;
-    const frames = Math.max(0, ((x.length - CFG.win) / CFG.hop) | 0) + 1;
-
-    const fft = new FFT(CFG.win);
-    const complex = fft.createComplexArray();
-    const inbuf = new Float64Array(CFG.win);
-    const out = new Array(frames);
-
-    for (let pos = 0, t = 0; pos + CFG.win <= x.length; pos += CFG.hop, t++) {
-        for (let i = 0; i < CFG.win; i++) inbuf[i] = x[pos + i] * hann[i];
-        fft.realTransform(complex, inbuf);
-
-        const mags = new Float32Array(half);
-        for (let b = 0; b < half; b++) mags[b] = Math.log1p(Math.hypot(complex[b * 2] || 0, complex[b * 2 + 1] || 0));
-        out[t] = mags;
-    }
-    return out;
-}
-
 function topK(row, K) {
     const idx = new Int32Array(K).fill(-1);
     const val = new Float32Array(K).fill(-Infinity);
@@ -89,63 +69,126 @@ function topK(row, K) {
     return r;
 }
 
-function hashes(mags) {
-    const peaks = mags.map((f) => topK(f, CFG.top).map((b) => Math.round(b / CFG.fq)));
-    const out = [];
+function fingerprintFromSamples(x, fileId) {
+    const half = CFG.win >> 1;
+    const fft = new FFT(CFG.win);
+    const complex = fft.createComplexArray();
+    const inbuf = new Float64Array(CFG.win);
 
-    for (let t = 0; t < peaks.length; t++) {
-        const a = peaks[t];
-        if (!a.length) continue;
+    // ring buffer holding recent frames (only need up to CFG.zone frames)
+    const buf = [];
+    let t = 0;
 
-        for (const f1q of a) {
-            const bestF = new Int32Array(CFG.pairs).fill(-1);
-            const bestDt = new Int32Array(CFG.pairs);
-            const bestS = new Float32Array(CFG.pairs).fill(-Infinity);
+    const outMap = Object.create(null);
 
-            for (let dt = 1; dt <= CFG.zone; dt++) {
-                const t2 = t + dt;
-                if (t2 >= peaks.length) break;
+    const makeBestStruct = () => ({
+        bestF: new Int32Array(CFG.pairs).fill(-1),
+        bestDt: new Int32Array(CFG.pairs),
+        bestS: new Float32Array(CFG.pairs).fill(-Infinity)
+    });
 
-                for (const f2q of peaks[t2]) {
-                    const b1 = clamp(f1q, 0, mags[t].length - 1);
-                    const b2 = clamp(f2q, 0, mags[t2].length - 1);
-                    const s = (mags[t][b1] || 1e-9) * (mags[t2][b2] || 1e-9);
+    const emitFrameResults = (frame) => {
+        for (const f1q of frame.peaks) {
+            const state = frame.best.get(f1q);
+            if (!state) continue;
+            for (let p = 0; p < CFG.pairs; p++) {
+                if (state.bestF[p] !== -1) {
+                    const key = `${f1q}-${state.bestF[p]}-${Math.round(state.bestDt[p] / CFG.dtq)}`;
+                    const arr = (outMap[key] ||= []);
+                    if (arr.length < CFG.bucket) arr.push([fileId, frame.t]);
+                }
+            }
+        }
+    };
 
-                    for (let i = 0; i < CFG.pairs; i++) {
-                        if (s > bestS[i]) {
-                            for (let k = CFG.pairs - 1; k > i; k--)(bestS[k] = bestS[k - 1]), (bestF[k] = bestF[k - 1]), (bestDt[k] = bestDt[k - 1]);
-                            bestS[i] = s;
-                            bestF[i] = f2q;
-                            bestDt[i] = dt;
+    for (let pos = 0; pos + CFG.win <= x.length; pos += CFG.hop, t++) {
+        for (let i = 0; i < CFG.win; i++) inbuf[i] = x[pos + i] * hann[i];
+        fft.realTransform(complex, inbuf);
+
+        const mags = new Float32Array(half);
+        for (let b = 0; b < half; b++) mags[b] = Math.log1p(Math.hypot(complex[b * 2] || 0, complex[b * 2 + 1] || 0));
+
+        const peaks = topK(mags, CFG.top).map((b) => Math.round(b / CFG.fq));
+        const frame = {
+            t,
+            peaks,
+            mags,
+            best: new Map()
+        };
+
+        // initialize best structs for each peak in this new frame
+        for (const f of peaks) frame.best.set(f, makeBestStruct());
+
+        // For each earlier frame in buffer (anchors), update their best arrays
+        for (let i = 0; i < buf.length; i++) {
+            const anchor = buf[i];
+            const dt = t - anchor.t;
+            if (dt > CFG.zone) {
+                // out of zone: finalize and emit anchor results
+                emitFrameResults(anchor);
+                // drop from buffer
+                buf.splice(i, 1);
+                i--;
+                continue;
+            }
+
+            // update best arrays for each peak in anchor using this current frame
+            for (const f1q of anchor.peaks) {
+                const state = anchor.best.get(f1q);
+                if (!state) continue;
+
+                for (const f2q of peaks) {
+                    const b1 = clamp(f1q, 0, anchor.mags.length - 1);
+                    const b2 = clamp(f2q, 0, mags.length - 1);
+                    const s = (anchor.mags[b1] || 1e-9) * (mags[b2] || 1e-9);
+
+                    // insert into sorted best arrays
+                    for (let p = 0; p < CFG.pairs; p++) {
+                        if (s > state.bestS[p]) {
+                            for (let k = CFG.pairs - 1; k > p; k--) {
+                                state.bestS[k] = state.bestS[k - 1];
+                                state.bestF[k] = state.bestF[k - 1];
+                                state.bestDt[k] = state.bestDt[k - 1];
+                            }
+                            state.bestS[p] = s;
+                            state.bestF[p] = f2q;
+                            state.bestDt[p] = dt;
                             break;
                         }
                     }
                 }
             }
+        }
 
-            for (let p = 0; p < CFG.pairs; p++) {
-                if (bestF[p] !== -1) out.push({
-                    key: `${f1q}-${bestF[p]}-${Math.round(bestDt[p] / CFG.dtq)}`,
-                    t
-                });
-            }
+        // push current frame to buffer
+        buf.push(frame);
+
+        // keep buffer length bounded
+        while (buf.length > CFG.zone + 2) {
+            const old = buf.shift();
+            emitFrameResults(old);
         }
     }
-    return out;
+
+    // after processing all frames, flush buffer
+    while (buf.length) {
+        const f = buf.shift();
+        emitFrameResults(f);
+    }
+
+    return outMap;
 }
 
 async function fingerprint(filePath, fileId) {
-    const mags = stftMags(await audioToF32(filePath));
-    const m = Object.create(null);
-    for (const {
-            key,
-            t
-        }
-        of hashes(mags)) {
-        const a = (m[key] ||= []);
-        if (a.length < CFG.bucket) a.push([fileId, t]);
+    const samples = await audioToF32(filePath);
+    try {
+        const m = fingerprintFromSamples(samples, fileId);
+        return m;
+    } finally {
+        // help GC
+        // eslint-disable-next-line no-unused-expressions
+        null;
     }
-    return m;
 }
 
 async function atomicWrite(file, data) {
