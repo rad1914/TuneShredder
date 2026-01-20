@@ -1,11 +1,13 @@
-import { spawn } from "node:child_process";
+import {
+    spawn
+} from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import FFT from "fft.js";
-import DB from "better-sqlite3";
-import { dbInit } from "./utils.js";
+import {
+    dbInit
+} from "./utils.js";
 
-const DBFILE = "./db/fp.sqlite";
 const EXT = /\.(mp3|wav|flac|ogg|opus|m4a)$/i;
 
 const C = {
@@ -18,6 +20,7 @@ const C = {
     zone: 30,
     min: 0.02,
     anchorEvery: 2,
+    maxMulti: 512,
 };
 
 const WIN = (() => {
@@ -68,7 +71,10 @@ const mkPeaks = () => {
                 }
             if (ins < 0) continue;
 
-            for (let i = C.top - 1; i > ins; i--)(mag[i] = mag[i - 1]), (bins[i] = bins[i - 1]);
+            for (let i = C.top - 1; i > ins; i--) {
+                mag[i] = mag[i - 1];
+                bins[i] = bins[i - 1];
+            }
             mag[ins] = a;
             bins[ins] = k;
         }
@@ -82,23 +88,20 @@ const mkPeaks = () => {
 
 const eachFrame = (file, cb) =>
     new Promise((res, rej) => {
-        const p = spawn(
-            "ffmpeg",
-            [
-                "-v", "error",
-                "-nostdin",
-                "-threads", "0",
-                "-i", file,
-                "-t", 85,
-                "-ac", "" + C.ch,
-                "-ar", "" + C.sr,
-                "-vn", "-sn", "-dn",
-                "-f", "f32le",
-                "pipe:1",
-            ], {
-                stdio: ["ignore", "pipe", "inherit"]
-            }
-        );
+        const p = spawn("ffmpeg", [
+            "-v", "error",
+            "-nostdin",
+            "-threads", "0",
+            "-i", file,
+            "-t", "85",
+            "-ac", "" + C.ch,
+            "-ar", "" + C.sr,
+            "-vn", "-sn", "-dn",
+            "-f", "f32le",
+            "pipe:1",
+        ], {
+            stdio: ["ignore", "pipe", "inherit"]
+        });
 
         const bps = 4,
             win = C.win,
@@ -116,8 +119,8 @@ const eachFrame = (file, cb) =>
             t = 0;
 
         const emit = () => {
-            const a = head;
-            const b = win - a;
+            const a = head,
+                b = win - a;
             for (let i = 0; i < b; i++) frame[i] = ring[a + i];
             for (let i = 0; i < a; i++) frame[b + i] = ring[i];
             cb(frame, t++);
@@ -144,57 +147,34 @@ const eachFrame = (file, cb) =>
         p.on("close", (c) => (c ? rej(new Error("ffmpeg decode failed")) : res(t)));
     });
 
+const mkInsertMany = (db, take) =>
+    db.prepare(
+        "INSERT OR IGNORE INTO fp(h,id,t) VALUES " +
+        Array.from({
+            length: take
+        }, () => "(?,?,?)").join(",")
+    );
+
 async function build(dir) {
     const db = dbInit();
 
     const insTrack = db.prepare("INSERT OR IGNORE INTO tracks(name) VALUES(?)");
     const getTrack = db.prepare("SELECT id FROM tracks WHERE name=?");
 
-    const MAX_MULTI = 512;
-    const insFpMany = db.prepare(
-        "INSERT OR IGNORE INTO fp(h,id,t) VALUES " +
-        Array.from({
-            length: MAX_MULTI
-        }, () => "(?,?,?)").join(",")
-    );
+    const insMax = mkInsertMany(db, C.maxMulti);
+    const argsBuf = new Array(C.maxMulti * 3);
 
-    const B = 200_000;
-    const Hh = new Int32Array(B);
-    const Tt = new Int32Array(B);
-    let bn = 0;
-
-    const stmtCache = new Map();
-    const getInsStmt = (take) => {
-        let st = stmtCache.get(take);
-        if (st) return st;
-        st = db.prepare(
-            "INSERT OR IGNORE INTO fp(h,id,t) VALUES " +
-            Array.from({ length: take }, () => "(?,?,?)").join(",")
-        );
-        stmtCache.set(take, st);
-        return st;
-    };
-
-    const argsBuf = new Array(MAX_MULTI * 3);
-
-    const addBatch = db.transaction((id, H, T, n) => {
+    const flushBatch = db.transaction((id, Hh, Tt, n) => {
         let i = 0;
         while (i < n) {
-            const take = Math.min(MAX_MULTI, n - i);
-            const args = argsBuf;
-
+            const take = Math.min(C.maxMulti, n - i);
             for (let k = 0; k < take; k++) {
-                args[3 * k] = H[i + k];
-                args[3 * k + 1] = id;
-                args[3 * k + 2] = T[i + k];
+                argsBuf[3 * k] = Hh[i + k];
+                argsBuf[3 * k + 1] = id;
+                argsBuf[3 * k + 2] = Tt[i + k];
             }
-
-            if (take === MAX_MULTI) {
-                insFpMany.run(...args);
-            } else {
-                getInsStmt(take).run(...args.slice(0, take * 3));
-            }
-
+            if (take === C.maxMulti) insMax.run(...argsBuf);
+            else mkInsertMany(db, take).run(...argsBuf.slice(0, take * 3));
             i += take;
         }
     });
@@ -204,6 +184,10 @@ async function build(dir) {
         .map((f) => path.join(dir, f));
 
     const peaks = mkPeaks();
+
+    const B = 200_000;
+    const Hh = new Int32Array(B);
+    const Tt = new Int32Array(B);
 
     for (const file of files) {
         const name = path.basename(file);
@@ -217,8 +201,9 @@ async function build(dir) {
         insTrack.run(name);
         const id = getTrack.get(name).id;
 
+        let bn = 0;
         const flush = () => {
-            if (bn) addBatch(id, Hh, Tt, bn), (bn = 0);
+            if (bn) flushBatch(id, Hh, Tt, bn), (bn = 0);
         };
         const add = (h, t) => {
             Hh[bn] = h;
@@ -261,7 +246,7 @@ async function build(dir) {
         flush();
     }
 
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_fp_id ON fp(id);`);
+    db.exec("CREATE INDEX IF NOT EXISTS idx_fp_id ON fp(id);");
 
     const tracks = db.prepare("SELECT COUNT(*) c FROM tracks").get().c;
     const buckets = db.prepare("SELECT COUNT(DISTINCT h) c FROM fp").get().c;
