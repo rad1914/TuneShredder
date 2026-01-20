@@ -1,9 +1,6 @@
 {
-  "type": "module",
   "dependencies": {
     "fast-glob": "^3.3.3",
-    "fft-js": "^0.0.12",
-    "fft.js": "^4.0.4",
-    "minimist": "^1.2.8"
+    "fft.js": "^4.0.4"
   }
 }
