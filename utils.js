@@ -1,7 +1,7 @@
 // @path: utils.js
 import Database from "better-sqlite3";
 
-const DBFILE = "./fingerprints.sqlite";
+const DBFILE = "./db/fs.sqlite";
 export let db;
 
 export const dbInit = () => {
