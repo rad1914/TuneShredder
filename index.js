@@ -1,4 +1,3 @@
-// @path: index.js
 import {
     spawn
 } from "node:child_process";
@@ -21,7 +20,7 @@ const C = {
     zone: 30,
     min: 0.02,
     anchorEvery: 2,
-    maxMulti: 512,
+    maxMulti: 256,
 };
 
 const WIN = (() => {
@@ -92,7 +91,7 @@ const eachFrame = (file, cb) =>
         const p = spawn("ffmpeg", [
             "-v", "error",
             "-nostdin",
-            "-threads", "0",
+            "-threads", "8",
             "-i", file,
             "-t", "85",
             "-ac", "" + C.ch,
@@ -159,10 +158,20 @@ const mkInsertMany = (db, take) =>
 async function build(dir) {
     const db = dbInit();
 
+    db.exec(`
+    PRAGMA journal_mode=WAL;
+    PRAGMA synchronous=OFF;
+    PRAGMA temp_store=MEMORY;
+    PRAGMA cache_size=-200000;
+    PRAGMA locking_mode=EXCLUSIVE;
+    `);
+
     const insTrack = db.prepare("INSERT OR IGNORE INTO tracks(name) VALUES(?)");
     const getTrack = db.prepare("SELECT id FROM tracks WHERE name=?");
 
-    const insMax = mkInsertMany(db, C.maxMulti);
+    const insMany = Array.from({ length: C.maxMulti + 1 }, (_, n) =>
+        n ? mkInsertMany(db, n) : null
+    );
     const argsBuf = new Array(C.maxMulti * 3);
 
     const flushBatch = db.transaction((id, Hh, Tt, n) => {
@@ -174,8 +183,7 @@ async function build(dir) {
                 argsBuf[3 * k + 1] = id;
                 argsBuf[3 * k + 2] = Tt[i + k];
             }
-            if (take === C.maxMulti) insMax.run(...argsBuf);
-            else mkInsertMany(db, take).run(...argsBuf.slice(0, take * 3));
+            insMany[take].run(...argsBuf.slice(0, take * 3));
             i += take;
         }
     });
@@ -186,7 +194,7 @@ async function build(dir) {
 
     const peaks = mkPeaks();
 
-    const B = 200_000;
+    const B = 50_000;
     const Hh = new Int32Array(B);
     const Tt = new Int32Array(B);
 
@@ -220,7 +228,8 @@ async function build(dir) {
 
         await eachFrame(file, (frame, t) => {
             const p = peaks(frame);
-            ringBins[rp].set(p.bins);
+            ringBins[rp].fill(0);
+            if (p.n) ringBins[rp].set(p.bins.subarray(0, p.n));
             ringN[rp] = p.n;
 
             if (p.n && (t % C.anchorEvery === 0)) {
@@ -248,6 +257,7 @@ async function build(dir) {
     }
 
     db.exec("CREATE INDEX IF NOT EXISTS idx_fp_id ON fp(id);");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_fp_h ON fp(h);");
 
     const tracks = db.prepare("SELECT COUNT(*) c FROM tracks").get().c;
     const buckets = db.prepare("SELECT COUNT(DISTINCT h) c FROM fp").get().c;
