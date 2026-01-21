@@ -1,3 +1,4 @@
+// @path: worker.js
 import { parentPort, workerData as C } from "worker_threads";
 import { spawn } from "child_process";
 import FFT from "fft.js";
