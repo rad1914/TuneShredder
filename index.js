@@ -1,6 +1,6 @@
 // @path: index.js
-import { Worker } from "worker_threads";
-import os from "os";
+import { Worker } from "node:worker_threads";
+import os from "node:os";
 import fs from "node:fs/promises";
 import path from "node:path";
 import Database from "better-sqlite3";
@@ -19,8 +19,10 @@ const C = {
   threads: 8,
 };
 
-function dbInit() {
-  awaitMkdir(path.dirname(DBFILE));
+const mkdirp = (dir) => fs.mkdir(dir, { recursive: true }).catch(() => {});
+
+async function dbInit() {
+  await mkdirp(path.dirname(DBFILE));
   const db = new Database(DBFILE);
   db.exec(`
     PRAGMA journal_mode=WAL;
@@ -28,16 +30,11 @@ function dbInit() {
     PRAGMA temp_store=MEMORY;
     PRAGMA cache_size=-200000;
     PRAGMA locking_mode=EXCLUSIVE;
-  `);
-  db.exec(`
+
     CREATE TABLE IF NOT EXISTS tracks(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
     CREATE TABLE IF NOT EXISTS fp(h INTEGER NOT NULL, id INTEGER NOT NULL, t INTEGER NOT NULL);
   `);
   return db;
-}
-
-async function awaitMkdir(dir) {
-  try { await fs.mkdir(dir, { recursive: true }); } catch {}
 }
 
 const mkInsertMany = (db, n) =>
@@ -46,6 +43,7 @@ const mkInsertMany = (db, n) =>
 function flushBatchFactory(db) {
   const insMany = Array.from({ length: C.maxMulti + 1 }, (_, n) => (n ? mkInsertMany(db, n) : null));
   const args = new Array(C.maxMulti * 3);
+
   return (id, Hh, Tt, n) => {
     for (let i = 0; i < n;) {
       const take = Math.min(C.maxMulti, n - i);
@@ -63,7 +61,8 @@ function flushBatchFactory(db) {
 async function main() {
   const dir = process.argv[2];
   if (!dir) throw new Error("usage: node main.js <music_dir>");
-  const db = dbInit();
+
+  const db = await dbInit();
   const insTrack = db.prepare("INSERT OR IGNORE INTO tracks(name) VALUES(?)");
   const getTrack = db.prepare("SELECT id FROM tracks WHERE name=?");
   const flushWriter = flushBatchFactory(db);
@@ -73,23 +72,17 @@ async function main() {
     .map((f) => path.join(dir, f));
 
   const cpus = Math.max(1, Math.min(os.cpus().length, C.threads || os.cpus().length));
-  const workers = [];
-
-  for (let i = 0; i < cpus; i++) {
-    const w = new Worker(new URL('./worker.js', import.meta.url), { workerData: C });
-    w.on("message", (msg) => {
-      if (msg.type === "batches") {
-        flushWriter(msg.id, msg.Hh, msg.Tt, msg.n);
-      } else if (msg.type === "log") {
-        process.stdout.write(msg.msg);
-      } else if (msg.type === "done") {
-        process.stdout.write(`\rProcessed: ${msg.name}\n`);
-      }
+  const workers = Array.from({ length: cpus }, () => {
+    const w = new Worker(new URL("./worker.js", import.meta.url), { workerData: C });
+    w.on("message", (m) => {
+      if (m.type === "batches") flushWriter(m.id, m.Hh, m.Tt, m.n);
+      else if (m.type === "log") process.stdout.write(m.msg);
+      else if (m.type === "done") process.stdout.write(`\rProcessed: ${m.name}\n`);
     });
-    w.on("error", (err) => console.error("Worker error:", err));
-    w.on("exit", (code) => { if (code) console.error("Worker exit code", code); });
-    workers.push(w);
-  }
+    w.on("error", (e) => console.error("Worker error:", e));
+    w.on("exit", (c) => c && console.error("Worker exit code", c));
+    return w;
+  });
 
   let wi = 0;
   for (const file of files) {
@@ -97,18 +90,19 @@ async function main() {
     if (getTrack.get(name)) continue;
     insTrack.run(name);
     const id = getTrack.get(name).id;
-    const w = workers[wi];
-    w.postMessage({ type: "file", path: file, id, name });
+    workers[wi].postMessage({ type: "file", path: file, id, name });
     wi = (wi + 1) % workers.length;
   }
 
   for (const w of workers) w.postMessage({ type: "drain" });
+  await Promise.all(workers.map((w) => new Promise((r) => w.once("exit", r))));
 
-  await Promise.all(workers.map(w => new Promise((res) => w.on("exit", res))));
-  db.exec("CREATE INDEX IF NOT EXISTS idx_fp_id ON fp(id);");
-  db.exec("CREATE INDEX IF NOT EXISTS idx_fp_h ON fp(h);");
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_fp_id ON fp(id);
+    CREATE INDEX IF NOT EXISTS idx_fp_h ON fp(h);
+  `);
   db.close();
   console.log("Indexing complete.");
 }
 
-main().catch(err => { console.error(err); process.exit(1); });
+main().catch((e) => (console.error(e), process.exit(1)));

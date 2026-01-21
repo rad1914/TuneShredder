@@ -1,9 +1,7 @@
 // @path: worker.js
-import { parentPort, workerData } from "worker_threads";
+import { parentPort, workerData as C } from "worker_threads";
 import { spawn } from "child_process";
 import FFT from "fft.js";
-
-const C = workerData;
 
 const WIN = (() => {
   const w = new Float32Array(C.win), n = w.length - 1;
@@ -13,54 +11,64 @@ const WIN = (() => {
 
 const H = (f1, f2, dt) => (((f1 & 2047) << 17) | ((f2 & 2047) << 6) | (dt & 63)) | 0;
 
-function makePeaksFactory() {
-  const fft = new FFT(C.win);
-  const out = fft.createComplexArray();
+const makePeaks = () => {
+  const fft = new FFT(C.win), out = fft.createComplexArray();
   const mags = new Float32Array(C.win / 2);
   const bins = new Int32Array(C.top);
   const mag = new Float32Array(C.top);
   const inp = new Float32Array(C.win);
+
   return (frame) => {
     for (let i = 0; i < C.win; i++) inp[i] = frame[i] * WIN[i];
     fft.realTransform(out, inp);
     fft.completeSpectrum(out);
+
     for (let k = 0; k < mags.length; k++) {
       const re = out[2 * k], im = out[2 * k + 1];
       mags[k] = re * re + im * im;
     }
-    bins.fill(0); mag.fill(0);
+
+    bins.fill(0);
+    mag.fill(0);
+
     for (let k = 2; k < mags.length - 2; k++) {
       const a = mags[k];
       if (a < C.min) continue;
       if (!(a > mags[k - 1] && a > mags[k + 1] && a > mags[k - 2] && a > mags[k + 2])) continue;
+
       let ins = -1;
       for (let i = 0; i < C.top; i++) if (a > mag[i]) { ins = i; break; }
       if (ins < 0) continue;
+
       for (let i = C.top - 1; i > ins; i--) { mag[i] = mag[i - 1]; bins[i] = bins[i - 1]; }
       mag[ins] = a; bins[ins] = k;
     }
+
     let n = 0;
     while (n < C.top && mag[n] > 0) n++;
     return { bins, n };
   };
-}
+};
 
-const peaks = makePeaksFactory();
+const peaks = makePeaks();
 
-async function eachFrame(file, cb) {
-  return new Promise((res, rej) => {
-    const p = spawn("ffmpeg", [
-      "-v", "error", "-nostdin", "-threads", "" + Math.max(1, Math.floor(C.win / 1024)),
-      "-i", file, "-t", "" + C.dur,
-      "-ac", "" + C.ch, "-ar", "" + C.sr,
-      "-vn", "-sn", "-dn",
-      "-f", "f32le", "pipe:1",
-    ], { stdio: ["ignore", "pipe", "inherit"] });
+const eachFrame = (file, cb) =>
+  new Promise((res, rej) => {
+    const p = spawn(
+      "ffmpeg",
+      [
+        "-v","error","-nostdin","-threads", "" + Math.max(1, (C.win / 1024) | 0),
+        "-i", file, "-t", "" + C.dur,
+        "-ac", "" + C.ch, "-ar", "" + C.sr,
+        "-vn","-sn","-dn",
+        "-f","f32le","pipe:1",
+      ],
+      { stdio: ["ignore", "pipe", "inherit"] }
+    );
 
-    const bps = 4, { win, hop } = C;
+    const bps = 4, { win, hop } = C, hopBytes = hop * bps;
     const ringBuf = Buffer.allocUnsafe(2 * win * bps);
     const ring = new Float32Array(ringBuf.buffer, ringBuf.byteOffset, 2 * win);
-    const hopBytes = hop * bps;
     const hopBuf = Buffer.allocUnsafe(hopBytes);
     const frame = new Float32Array(win);
 
@@ -80,6 +88,7 @@ async function eachFrame(file, cb) {
         hopFill += take;
         off += take;
         if (hopFill !== hopBytes) continue;
+
         hopFill = 0;
         const v = new Float32Array(hopBuf.buffer, hopBuf.byteOffset, hop);
         ring.set(v, head);
@@ -90,60 +99,68 @@ async function eachFrame(file, cb) {
       }
     });
 
-    p.on("close", (c) => (c ? rej(new Error("ffmpeg decode failed")) : res(t)));
+    p.on("close", (c) => (c ? rej(Error("ffmpeg decode failed")) : res(t)));
   });
-}
 
 parentPort.on("message", async (m) => {
-  if (m.type === "file") {
-    const { path: file, id, name } = m;
-    try {
-      parentPort.postMessage({ type: "log", msg: `\r${name}\x1b[K` });
+  if (m.type === "drain") return setTimeout(() => process.exit(0), 200);
+  if (m.type !== "file") return;
 
-      const B = 50_000;
-      const Hh = new Int32Array(B);
-      const Tt = new Int32Array(B);
-      let bn = 0;
-      const flush = (send = true) => {
-        if (!bn) return;
-        const subH = Hh.subarray(0, bn);
-        const subT = Tt.subarray(0, bn);
-        parentPort.postMessage({ type: "batches", id, Hh: Array.from(subH), Tt: Array.from(subT), n: bn });
-        bn = 0;
-      };
-      const add = (h, t) => { Hh[bn] = h; Tt[bn] = t; if (++bn === B) flush(); };
+  const { path: file, id, name } = m;
 
-      const ringBins = Array.from({ length: C.zone + 1 }, () => new Int32Array(C.top));
-      const ringN = new Int8Array(C.zone + 1);
-      let rp = 0;
+  try {
+    parentPort.postMessage({ type: "log", msg: `\r${name}\x1b[K` });
 
-      await eachFrame(file, (frame, t) => {
-        const p = peaks(frame);
-        ringBins[rp].fill(0);
-        if (p.n) ringBins[rp].set(p.bins.subarray(0, p.n));
-        ringN[rp] = p.n;
+    const B = 50_000, Hh = new Int32Array(B), Tt = new Int32Array(B);
+    let bn = 0;
 
-        if (p.n && t % C.anchorEvery === 0) {
-          const f2n = Math.min(C.fan, p.n);
-          for (let back = 1; back <= C.zone; back++) {
-            const pos = (rp - back + ringBins.length) % ringBins.length;
-            const nPrev = ringN[pos];
-            if (!nPrev) continue;
-            const prev = ringBins[pos], tt = t - back;
-            for (let i = 0; i < nPrev; i++) for (let j = 0; j < f2n; j++)
-              add(H(prev[i], p.bins[j], back), tt);
-          }
-        }
-        rp = (rp + 1) % ringBins.length;
+    const flush = () => {
+      if (!bn) return;
+      parentPort.postMessage({
+        type: "batches",
+        id,
+        Hh: Array.from(Hh.subarray(0, bn)),
+        Tt: Array.from(Tt.subarray(0, bn)),
+        n: bn,
       });
+      bn = 0;
+    };
 
-      flush();
-      parentPort.postMessage({ type: "done", name });
-    } catch (e) {
-      parentPort.postMessage({ type: "log", msg: `\rERROR ${name}: ${String(e)}\n` });
-    }
-  } else if (m.type === "drain") {
+    const add = (h, t) => {
+      Hh[bn] = h;
+      Tt[bn] = t;
+      if (++bn === B) flush();
+    };
 
-    setTimeout(() => process.exit(0), 200);
+    const ringBins = Array.from({ length: C.zone + 1 }, () => new Int32Array(C.top));
+    const ringN = new Int8Array(C.zone + 1);
+    let rp = 0;
+
+    await eachFrame(file, (frame, t) => {
+      const p = peaks(frame);
+
+      ringBins[rp].fill(0);
+      if (p.n) ringBins[rp].set(p.bins.subarray(0, p.n));
+      ringN[rp] = p.n;
+
+      if (p.n && t % C.anchorEvery === 0) {
+        const f2n = Math.min(C.fan, p.n), len = ringBins.length;
+        for (let back = 1; back <= C.zone; back++) {
+          const pos = (rp - back + len) % len, nPrev = ringN[pos];
+          if (!nPrev) continue;
+          const prev = ringBins[pos], tt = t - back;
+          for (let i = 0; i < nPrev; i++)
+            for (let j = 0; j < f2n; j++)
+              add(H(prev[i], p.bins[j], back), tt);
+        }
+      }
+
+      rp = (rp + 1) % ringBins.length;
+    });
+
+    flush();
+    parentPort.postMessage({ type: "done", name });
+  } catch (e) {
+    parentPort.postMessage({ type: "log", msg: `\rERROR ${name}: ${String(e)}\n` });
   }
 });
