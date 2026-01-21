@@ -1,4 +1,3 @@
-// @path: worker.js
 import { parentPort, workerData as C } from "worker_threads";
 import { spawn } from "child_process";
 import FFT from "fft.js";
@@ -54,17 +53,27 @@ const peaks = makePeaks();
 
 const eachFrame = (file, cb) =>
   new Promise((res, rej) => {
+    const threads = Math.max(1, Math.floor(C.win / 1024));
     const p = spawn(
       "ffmpeg",
       [
-        "-v","error","-nostdin","-threads", "" + Math.max(1, (C.win / 1024) | 0),
-        "-i", file, "-t", "" + C.dur,
-        "-ac", "" + C.ch, "-ar", "" + C.sr,
-        "-vn","-sn","-dn",
-        "-f","f32le","pipe:1",
+        "-v", "error", "-nostdin",
+        "-threads", String(threads),
+        "-i", file,
+        "-t", String(C.dur),
+        "-ac", String(C.ch),
+        "-ar", String(C.sr),
+        "-vn", "-sn", "-dn",
+        "-f", "f32le",
+        "-acodec", "pcm_f32le",
+        "pipe:1",
       ],
-      { stdio: ["ignore", "pipe", "inherit"] }
+      { stdio: ["ignore", "pipe", "pipe"] }
     );
+
+    p.on("error", (err) => rej(err));
+
+    p.stderr.on("data", () => {});
 
     const bps = 4, { win, hop } = C, hopBytes = hop * bps;
     const ringBuf = Buffer.allocUnsafe(2 * win * bps);
@@ -159,6 +168,7 @@ parentPort.on("message", async (m) => {
     });
 
     flush();
+
     parentPort.postMessage({ type: "done", name });
   } catch (e) {
     parentPort.postMessage({ type: "log", msg: `\rERROR ${name}: ${String(e)}\n` });
