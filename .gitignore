@@ -13,3 +13,6 @@ out.json
 data
 db
 matches
+model
+logs.txt
+logs.js
