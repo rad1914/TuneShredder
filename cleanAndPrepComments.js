@@ -1,6 +1,5 @@
 import { promises as fs } from "fs";
 import { resolve, relative, extname } from "path";
-import fg from "fast-glob";
 import { fileURLToPath } from "url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -13,7 +12,7 @@ function toPosixPath(path) {
 
 function getFileType(ext) {
   ext = ext.toLowerCase();
-  if (ext === '.js' || ext === '.cjs' || ext === '.kt' || ext === '.sh') return 'code';
+  if (ext === '.js' || ext === '.cjs' || ext === '.mjs' || ext === '.kt' || ext === '.sh') return 'code';
   if (ext === '.xml') return 'xml';
   if (ext === '.html') return 'html';
   return null;
@@ -42,10 +41,9 @@ async function processFile(filePath) {
     return;
   }
 
-  // Choose the correct comment prefix
   let commentLine;
   if (fileType === 'xml' || fileType === 'html') {
-    commentLine = `<!-- @path: ${relPath} -->\n`;
+    commentLine = `\n`;
   } else if (ext === '.sh') {
     commentLine = `# @path: ${relPath}\n`;
   } else {
@@ -56,7 +54,6 @@ async function processFile(filePath) {
   const header = content.slice(0, 500);
 
   if (!pathCommentRegex.test(header)) {
-    // XML declaration handling
     if ((fileType === 'xml' || fileType === 'html') && content.startsWith('<?xml')) {
       const endDecl = content.indexOf('?>');
       if (endDecl !== -1) {
@@ -76,36 +73,25 @@ async function processFile(filePath) {
 
   if (fileType === 'code') {
     content = content
-      // Keep only /*…*/ blocks if they contain @path:
       .replace(/\/\*[\s\S]*?\*\//g, m => m.includes('@path:') ? m : '')
-      // Keep only // lines if they contain @path:
       .replace(/^\s*\/\/.*$/gm, line => line.includes('@path:') ? line : '')
-      // Keep only # lines if they contain @path (for .sh):
       .replace(/^\s*#.*$/gm, line => line.includes('@path:') ? line : '')
-      // Remove inline // comments that don’t contain @path:
       .replace(/([^:"'\n])\/\/(?!.*@path:).*$/gm, (_, p) => p.trimEnd())
-      // Remove citation marks:
       .replace(/\[cite\s*:\s*\d+(?:\s*,\s*\d+)*\]/g, '')
       .replace(/\[cite(?:_start|_end)?\]/g, '')
-      // Remove all span markers (start or end), even if nested/misaligned:
       .replace(/\[span_\d+\]\((?:start|end)_span\)/g, '')
-      // Drop any now-empty lines:
       .replace(/^\s*$/gm, '');
-  } else if (fileType === 'xml' || fileType === 'html') {
-    content = content
-      // Keep only <!--…--> comments with @path:
-      .replace(/<!--[\s\S]*?-->/g, m => m.includes('@path:') ? m : '');
-  }
+} else if (fileType === 'xml' || fileType === 'html') {
+  content = content
+    .replace(/<!--[\s\S]*?-->/g, m => m.includes('@path:') ? m : '');
+}
 
-  // Debug: warn if any span markers still exist
   if (content.includes('[span_')) {
     console.warn(`⚠️ Unremoved spans in ${relPath}`);
   }
 
-  // Collapse excessive blank lines to at most two in a row
   content = content.replace(/\n{3,}/g, '\n\n');
 
-  // Ensure final newline
   if (!content.endsWith('\n')) content += '\n';
 
   try {
@@ -117,18 +103,27 @@ async function processFile(filePath) {
 }
 
 async function main() {
-  const pattern = process.argv[2] || '**/*.{js,kt,xml,html,sh}';
-  let entries = await fg(pattern, {
-    dot: true,
-    ignore: ['node_modules/**'],
-  });
+  const exts = new Set(['.js','.cjs','.mjs','.kt','.xml','.html','.sh']);
+  const entries = [];
 
-  entries = entries
-    .map(toPosixPath)
-    .filter(f => f !== scriptRelPath);
+  async function walk(dir) {
+    const list = await fs.readdir(dir, { withFileTypes: true });
+    for (const d of list) {
+      if (d.name === 'node_modules') continue;
+      const full = resolve(dir, d.name);
+      if (d.isDirectory()) {
+        await walk(full);
+      } else if (exts.has(extname(d.name))) {
+        const rel = toPosixPath(relative(cwd, full));
+        if (rel !== scriptRelPath) entries.push(rel);
+      }
+    }
+  }
+
+  await walk(cwd);
 
   if (!entries.length) {
-    console.warn('No files found for pattern:', pattern);
+    console.warn('No files found');
     return;
   }
 

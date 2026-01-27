@@ -1,154 +1,120 @@
-const fs = require('fs').promises;
-const os = require('os');
+const fs = require('fs');
+const path = require('path');
 
-const SONGS_JSON = './songs.json';
-const PREFILTER_K = 20;
-const CONCURRENCY = Math.max(1, Math.min(os.cpus().length - 1, 8));
+const DB = path.join(__dirname, 'db');
+const SONGS = path.join(DB, "'_songs.json");
+const OUT = path.join(DB, "'_matches.json");
 
-async function buildIndex() {
-  const raw = await fs.readFile(SONGS_JSON, 'utf8');
-  const songs = JSON.parse(raw);
-  const index = [];
-  for (const id of Object.keys(songs)) {
-    const meta = songs[id];
-    let seq;
-    try {
-      seq = await loadSongEmbeddings(meta);
-    } catch {
-      seq = null;
+const DIM = 96;
+const TOP_K = 60;
+const SCORE_THRESHOLD = 0.99;
+
+const readFloat32 = buf => new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
+
+function loadMeta(meta) {
+  const f = path.join(DB, meta.embFile);
+  if (!fs.existsSync(f)) return null;
+  const buf = readFloat32(fs.readFileSync(f));
+  const frames = (buf.length / DIM) | 0;
+  for (let i = 0; i < frames; i++) {
+    let off = i * DIM, n = 0;
+    for (let d = 0; d < DIM; d++) {
+      const v = buf[off + d];
+      n += v * v;
     }
-    if (seq && seq.length > 0) {
-      const mean = computeMean(seq);
-      index.push({ id, meta, mean, embedLength: seq.length, embedPath: meta.embedPath || null });
-    } else {
-      index.push({ id, meta, mean: null, embedLength: 0, embedPath: meta.embedPath || null });
-    }
+    n = Math.sqrt(n) || 1;
+    for (let d = 0; d < DIM; d++) buf[off + d] /= n;
   }
-  return index;
+  return { buf, frames };
 }
 
-function computeMean(seq) {
-  const dim = seq[0].length;
-  const out = new Float64Array(dim);
-  for (let i = 0; i < seq.length; i++) {
-    const v = seq[i];
-    for (let j = 0; j < dim; j++) out[j] += v[j];
+function meanVector(data) {
+  const mean = new Float32Array(DIM);
+  for (let i = 0; i < data.frames; i++) {
+    let off = i * DIM;
+    for (let d = 0; d < DIM; d++) mean[d] += data.buf[off + d];
   }
-  const inv = 1 / seq.length;
-  for (let j = 0; j < dim; j++) out[j] *= inv;
-  return out;
+  let norm = 0;
+  for (let d = 0; d < DIM; d++) norm += mean[d] * mean[d];
+  norm = Math.sqrt(norm) || 1;
+  for (let d = 0; d < DIM; d++) mean[d] /= norm;
+  return mean;
 }
 
-function l2norm(vec) {
+function dot(a, b) {
   let s = 0;
-  for (let i = 0; i < vec.length; i++) s += vec[i] * vec[i];
-  return Math.sqrt(s);
+  for (let i = 0; i < DIM; i++) s += a[i] * b[i];
+  return s;
 }
 
-function cosine(a, b, aNorm = null, bNorm = null) {
-  if (!a || !b) return -1;
-  if (a.length !== b.length) return -1;
-  if (aNorm === null) aNorm = l2norm(a);
-  if (bNorm === null) bNorm = l2norm(b);
-  if (aNorm === 0 || bNorm === 0) return -1;
-  let dot = 0;
-  for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
-  return dot / (aNorm * bNorm);
-}
-
-function topKCandidates(index, qMean, k = PREFILTER_K) {
-  const qNorm = l2norm(qMean);
-  const scores = [];
-  for (const item of index) {
-    if (!item.mean) {
-      scores.push({ id: item.id, score: -Infinity });
-      continue;
+function slide(q, s) {
+  let best = -Infinity, pos = -1;
+  const limit = s.frames - q.frames;
+  for (let i = 0; i <= limit; i++) {
+    let sum = 0, aoff = 0, boff = i * DIM;
+    for (let j = 0; j < q.frames; j++, aoff += DIM, boff += DIM) {
+      for (let k = 0; k < DIM; k++) sum += q.buf[aoff + k] * s.buf[boff + k];
     }
-    const s = cosine(qMean, item.mean, qNorm, null);
-    scores.push({ id: item.id, score: s });
+    const score = sum / q.frames;
+    if (score > best) { best = score; pos = i; }
   }
-  scores.sort((a, b) => b.score - a.score);
-  return scores.slice(0, k).map(s => s.id);
+  return { score: best, pos };
 }
 
-async function limitedMap(inputs, workerFn, concurrency = CONCURRENCY) {
-  const out = [];
-  let i = 0;
-  const running = [];
-  while (i < inputs.length || running.length) {
-    while (i < inputs.length && running.length < concurrency) {
-      const p = Promise.resolve().then(() => workerFn(inputs[i]));
-      running.push(p);
-      const idx = i;
-      i++;
-      p.then(result => { out[idx] = result; })
-       .catch(err => { out[idx] = { error: err }; });
-    }
-    await Promise.race(running).catch(()=>{});
-    for (let r = running.length - 1; r >= 0; r--) {
-      if (running[r].isFulfilled || running[r].isRejected) running.splice(r, 1);
-    }
-    // Node native promises don't have isFulfilled; safe prune:
-    for (let r = running.length - 1; r >= 0; r--) {
-      if (running[r].settled) running.splice(r, 1);
-    }
-    // fallback: rebuild running from still-pending promises
-    // (keeps memory in control if .settled isn't available)
-    running.length = 0;
-  }
-  return out;
-}
+(async () => {
+  const songsMeta = JSON.parse(fs.readFileSync(SONGS, 'utf8'));
+  const ids = Object.keys(songsMeta);
 
-async function queryFile(filePath, index = null) {
-  const model = await ensureModel();
-  const qembs = await processAudioToEmbeddings(model, filePath);
-  if (!qembs || qembs.length === 0) return { best: null, adapt: { accept: false } };
-
-  if (!index) index = await buildIndex();
-
-  const qMean = computeMean(qembs);
-  const candidates = topKCandidates(index, qMean, PREFILTER_K);
-
-  const perSongResults = [];
-  const scoreDist = [];
-
-  const worker = async (songId) => {
-    const item = index.find(x => x.id === songId);
-    let seq = null;
-    try {
-      seq = item.embedPath ? await fs.readFile(item.embedPath) : await loadSongEmbeddings(item.meta);
-      if (Buffer.isBuffer(seq)) seq = JSON.parse(seq.toString('utf8'));
-    } catch {
-      seq = await loadSongEmbeddings(item.meta);
-    }
-    if (!seq || seq.length === 0) return { id: songId, score: -Infinity, pos: -1 };
-    const res = scoreSequenceMatch(qembs, seq);
-    return { id: songId, score: res.bestScore, pos: res.pos };
-  };
-
-  const results = [];
-  for (let i = 0; i < candidates.length; i += CONCURRENCY) {
-    const chunk = candidates.slice(i, i + CONCURRENCY);
-    const chunkRes = await Promise.all(chunk.map(worker));
-    results.push(...chunkRes);
-    for (const r of chunkRes) scoreDist.push(r.score);
+  const cache = new Map();
+  for (const id of ids) {
+    const data = loadMeta(songsMeta[id]);
+    if (data) cache.set(id, { meta: songsMeta[id], data });
   }
 
-  results.sort((a, b) => b.score - a.score);
-  const best = results[0] || null;
-  const second = results[1] || { score: -Infinity };
-  const adapt = adaptiveDecision(best ? best.score : -Infinity, best ? best.id : null, second.score, qembs.length, scoreDist);
+  const means = new Map();
+  for (const [id, { data }] of cache) means.set(id, meanVector(data));
 
-  return { best, second, adapt, rawResults: results };
-}
+  const matches = [];
 
-function adaptiveDecision(bestScore, bestId, secondScore, qLen, scoreDist) {
-  if (!scoreDist || scoreDist.length === 0) return { accept: false, reason: 'no-data' };
-  const mean = scoreDist.reduce((a,b)=>a+b,0)/scoreDist.length;
-  const sd = Math.sqrt(scoreDist.reduce((s,x)=>s+(x-mean)*(x-mean),0)/scoreDist.length);
-  const z = sd > 0 ? (bestScore - mean) / sd : 0;
-  const margin = 0.12;
-  const minAbsolute = 0.6;
-  const accept = (bestScore >= minAbsolute && bestScore - secondScore > margin) || z >= 3;
-  return { accept, bestScore, secondScore, z, mean, sd };
-}
+  for (let idx = 0; idx < ids.length; idx++) {
+    const a = ids[idx];
+    const qa = cache.get(a);
+    if (!qa) continue;
+    console.log(`(${idx + 1}/${ids.length}) processing ${a}`);
+
+    const sims = [];
+    for (const b of ids) {
+      if (a === b) continue;
+      const mb = means.get(b);
+      if (!mb) continue;
+      sims.push({ id: b, sim: dot(means.get(a), mb) });
+    }
+
+    sims.sort((x, y) => y.sim - x.sim);
+    const candidates = sims.filter(s => s.sim >= SCORE_THRESHOLD).slice(0, TOP_K).map(s => s.id);
+    if (!candidates.length) continue;
+
+    for (const b of candidates) {
+      const qaData = cache.get(a).data;
+      const qbData = cache.get(b).data;
+      const needleQ = qaData.frames <= qbData.frames;
+      const r = needleQ ? slide(qaData, qbData) : slide(qbData, qaData);
+      if (r.score < SCORE_THRESHOLD) continue;
+      matches.push({
+        a,
+        b,
+        score: +r.score.toFixed(6),
+        pos: r.pos,
+        needleQ,
+        sizeA: fs.statSync(path.join(DB, songsMeta[a].embFile)).size,
+        sizeB: fs.statSync(path.join(DB, songsMeta[b].embFile)).size
+      });
+    }
+  }
+
+  fs.writeFileSync(OUT, JSON.stringify(matches, null, 2), 'utf8');
+  console.log('Saved matches to', OUT);
+})().catch(e => {
+  console.error(e);
+  process.exit(1);
+});

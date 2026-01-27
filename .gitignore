@@ -1,18 +1,31 @@
-node_modules
-dupe.txt
+# Dependencies
+node_modules/
+
+# Temp / cache
 .dedupe-cache.json
-_FULL
-m.shazam-index.json
-t.shazam-index.json
-t
-.shazam-index.json
-m
-index.json
-test.m4a
-out.json
-data
-db
-matches
-model
+*.log
+*.txt
+*.json
 logs.txt
-logs.js
+
+# Generated indexes
+index.json
+out.json
+matches.json
+means.json
+
+# Data folders
+data/
+db/
+db1/
+model/
+
+# Test / junk
+test.m4a
+dupe.txt
+songs.json
+
+# Random dirs
+t/
+m/
+_FULL/
