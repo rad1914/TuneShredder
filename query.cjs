@@ -7,7 +7,7 @@ const OUT = path.join(DB, "'_matches.json");
 
 const DIM = 96;
 const TOP_K = 60;
-const SCORE_THRESHOLD = 0.99;
+const SCORE_THRESHOLD = 0.996;
 
 const readFloat32 = buf => new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
 
